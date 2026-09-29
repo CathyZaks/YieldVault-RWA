@@ -26,7 +26,7 @@ export const PaginationQuerySchema = z
   .object({
     limit: z.string().regex(/^\d+$/, 'limit must be a positive integer').optional(),
     cursor: z.string().optional(),
-    page: z.string().regex(/^\d+$/, 'page must be a positive integer').optional(),
+    page: z.string().regex(/^-?\d+$/, 'page must be an integer').optional(),
     sortBy: z.string().optional(),
     sortOrder: z.string().optional(),
     dryRun: z.enum(['true', 'false', '1', '0']).optional(),

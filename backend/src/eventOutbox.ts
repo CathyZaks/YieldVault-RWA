@@ -15,13 +15,39 @@
  */
 
 import crypto from 'crypto';
-import { prisma } from './prisma';
 import { logger } from './middleware/structuredLogging';
 import {
   emitTransactionEvent,
   type TransactionEventType,
   type TransactionEventPayload,
 } from './webhookDelivery';
+
+// ─── Prisma Access ───────────────────────────────────────────────────────────
+
+/**
+ * Lazily resolves the Prisma client and its `eventOutbox` delegate.
+ *
+ * Importing `prisma` at module load time is fragile: depending on the runtime
+ * path (e.g. test harnesses, hot-reload, or a partially initialized client),
+ * the imported binding can be undefined or lack the `eventOutbox` delegate,
+ * causing `prisma.eventOutbox.create` to throw
+ * "Cannot read properties of undefined (reading 'create')".
+ *
+ * Resolving the delegate at call time (with a clear error if unavailable)
+ * makes the failure mode explicit and robust across runtime paths.
+ */
+function getEventOutboxDelegate() {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { prisma } = require('./prisma') as typeof import('./prisma');
+  const delegate = prisma?.eventOutbox;
+  if (!delegate) {
+    throw new Error(
+      'Prisma client is not initialized or missing the `eventOutbox` delegate. ' +
+        'Ensure `prisma generate` has run and the client is instantiated before use.',
+    );
+  }
+  return delegate;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -125,7 +151,7 @@ class EventOutboxService {
    */
   async writeEvent(input: OutboxWriteInput): Promise<EventOutboxRecord> {
     const now = new Date();
-    const record = await prisma.eventOutbox.create({
+    const record = await getEventOutboxDelegate().create({
       data: {
         id: `obx-${crypto.randomUUID()}`,
         eventType: input.eventType,
@@ -162,7 +188,7 @@ class EventOutboxService {
 
     try {
       // 1. Find eligible entries: pending or failed entries whose lock is expired
-      const candidates = await prisma.eventOutbox.findMany({
+      const candidates = await getEventOutboxDelegate().findMany({
         where: {
           status: { in: ['pending', 'failed'] },
           OR: [
@@ -180,7 +206,7 @@ class EventOutboxService {
 
       // 2. Lock the claimed entries by updating lockedAt/lockedBy in bulk
       const candidateIds = candidates.map((e) => e.id);
-      await prisma.eventOutbox.updateMany({
+      await getEventOutboxDelegate().updateMany({
         where: {
           id: { in: candidateIds },
           OR: [
@@ -196,7 +222,7 @@ class EventOutboxService {
 
       // 3. Re-fetch the entries we successfully locked (some may have been
       //    concurrently claimed by another instance)
-      const entries = await prisma.eventOutbox.findMany({
+      const entries = await getEventOutboxDelegate().findMany({
         where: {
           id: { in: candidateIds },
           lockedBy: this.instanceId,
@@ -224,7 +250,7 @@ class EventOutboxService {
             payload,
           );
 
-          await prisma.eventOutbox.update({
+          await getEventOutboxDelegate().update({
             where: { id: entry.id },
             data: {
               status: 'relayed',
@@ -250,7 +276,7 @@ class EventOutboxService {
 
           if (nextAttempt >= entry.maxAttempts) {
             // Exhausted retries — move to dead_letter
-            await prisma.eventOutbox.update({
+            await getEventOutboxDelegate().update({
               where: { id: entry.id },
               data: {
                 status: 'dead_letter',
@@ -273,7 +299,7 @@ class EventOutboxService {
             void this.sendDeadLetterAlert(entry.id, entry.eventType, nextAttempt, errorMessage);
           } else {
             // Mark as failed for retry
-            await prisma.eventOutbox.update({
+            await getEventOutboxDelegate().update({
               where: { id: entry.id },
               data: {
                 status: 'failed',
@@ -333,12 +359,12 @@ class EventOutboxService {
    * Retries a specific dead-lettered event by resetting its status to pending.
    */
   async retryDeadLetter(outboxId: string): Promise<EventOutboxRecord | null> {
-    const entry = await prisma.eventOutbox.findUnique({ where: { id: outboxId } });
+    const entry = await getEventOutboxDelegate().findUnique({ where: { id: outboxId } });
     if (!entry || entry.status !== 'dead_letter') {
       return null;
     }
 
-    const updated = await prisma.eventOutbox.update({
+    const updated = await getEventOutboxDelegate().update({
       where: { id: outboxId },
       data: {
         status: 'pending',
@@ -363,7 +389,7 @@ class EventOutboxService {
   async cleanup(maxAgeMs?: number): Promise<number> {
     const cutoff = new Date(Date.now() - (maxAgeMs ?? getRetentionMs()));
 
-    const result = await prisma.eventOutbox.deleteMany({
+    const result = await getEventOutboxDelegate().deleteMany({
       where: {
         createdAt: { lt: cutoff },
         status: { in: ['relayed', 'dead_letter'] },
@@ -385,7 +411,7 @@ class EventOutboxService {
    * Used to recover any events that were written but not relayed before a crash.
    */
   async replayOnStartup(): Promise<OutboxRelayResult> {
-    const pendingCount = await prisma.eventOutbox.count({
+    const pendingCount = await getEventOutboxDelegate().count({
       where: { status: { in: ['pending', 'failed'] } },
     });
 
@@ -479,17 +505,17 @@ class EventOutboxService {
    */
   async getMetrics(): Promise<OutboxMetrics> {
     const [pending, relayed, failed, deadLettered, locked, total] = await Promise.all([
-      prisma.eventOutbox.count({ where: { status: 'pending' } }),
-      prisma.eventOutbox.count({ where: { status: 'relayed' } }),
-      prisma.eventOutbox.count({ where: { status: 'failed' } }),
-      prisma.eventOutbox.count({ where: { status: 'dead_letter' } }),
-      prisma.eventOutbox.count({
+      getEventOutboxDelegate().count({ where: { status: 'pending' } }),
+      getEventOutboxDelegate().count({ where: { status: 'relayed' } }),
+      getEventOutboxDelegate().count({ where: { status: 'failed' } }),
+      getEventOutboxDelegate().count({ where: { status: 'dead_letter' } }),
+      getEventOutboxDelegate().count({
         where: {
           status: { in: ['pending', 'failed'] },
           lockedAt: { not: null },
         },
       }),
-      prisma.eventOutbox.count(),
+      getEventOutboxDelegate().count(),
     ]);
 
     return { pending, relayed, failed, deadLettered, locked, total };
@@ -519,7 +545,7 @@ class EventOutboxService {
       where.aggregateId = filters.aggregateId;
     }
 
-    const rows = await prisma.eventOutbox.findMany({
+    const rows = await getEventOutboxDelegate().findMany({
       where,
       orderBy: { createdAt: 'desc' },
       take: filters.limit ?? 100,

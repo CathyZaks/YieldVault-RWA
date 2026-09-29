@@ -617,6 +617,7 @@ model Vault {
   tenantId  String
   aum       Float     @default(0)
   tvlUsd    String?
+  metadataURI String?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
@@ -625,6 +626,20 @@ model Vault {
 
   @@index([tenantId])
   @@index([deletedAt])
+}
+
+model VaultMetadataPin {
+  id        String    @id @default(uuid())
+  vaultId   String    @unique
+  cid       String
+  pinnedAt  DateTime  @default(now())
+  unpinnedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([cid])
+  @@index([pinnedAt])
+  @@index([unpinnedAt])
 }
 
 model Strategy {

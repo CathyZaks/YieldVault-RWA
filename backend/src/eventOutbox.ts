@@ -102,6 +102,21 @@ function getInstanceId(): string {
   return process.env.OUTBOX_INSTANCE_ID || `instance-${crypto.randomUUID().slice(0, 8)}`;
 }
 
+/**
+ * Throws if the Prisma client has no `eventOutbox` model delegate (e.g. a stale
+ * generated client or a mocked client missing the model). Without this guard
+ * the failure surfaces as a `Cannot read properties of undefined` TypeError
+ * deep inside fire-and-forget writes, where callers only log it.
+ */
+export function assertEventOutboxModelAvailable(client: unknown = prisma): void {
+  const delegate = (client as { eventOutbox?: { create?: unknown } } | null | undefined)?.eventOutbox;
+  if (!delegate || typeof delegate.create !== 'function') {
+    throw new Error(
+      'Prisma client is missing the eventOutbox model. Run `prisma generate` and ensure the EventOutbox migration is applied.',
+    );
+  }
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 class EventOutboxService {
@@ -124,6 +139,7 @@ class EventOutboxService {
    * Returns the created outbox record.
    */
   async writeEvent(input: OutboxWriteInput): Promise<EventOutboxRecord> {
+    assertEventOutboxModelAvailable();
     const now = new Date();
     const record = await prisma.eventOutbox.create({
       data: {
@@ -385,6 +401,7 @@ class EventOutboxService {
    * Used to recover any events that were written but not relayed before a crash.
    */
   async replayOnStartup(): Promise<OutboxRelayResult> {
+    assertEventOutboxModelAvailable();
     const pendingCount = await prisma.eventOutbox.count({
       where: { status: { in: ['pending', 'failed'] } },
     });
@@ -412,6 +429,9 @@ class EventOutboxService {
       logger.log('warn', 'Outbox processor is already running');
       return;
     }
+
+    // Fail fast at initialization rather than logging on every poll cycle.
+    assertEventOutboxModelAvailable();
 
     this.isRunning = true;
     const intervalMs = getPollIntervalMs();

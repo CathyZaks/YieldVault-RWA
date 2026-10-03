@@ -640,6 +640,8 @@ model WriteAheadAuditEntry {
 model Vault {
   id        String    @id @default(uuid())
   tenantId  String
+  name      String
+  symbol    String
   aum       Float     @default(0)
   tvlUsd    String?
   metadataURI String?

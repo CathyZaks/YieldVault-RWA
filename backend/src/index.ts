@@ -80,7 +80,6 @@ import { createVersionDiscoveryRouter } from './routes/apiVersions';
 import { GracefulShutdownHandler } from './gracefulShutdown';
 import { db } from './database';
 import vaultRouter from './vaultEndpoints';
-import vaultsListRouter from './routes/vaults';
 import walletAliasRouter from './walletAliasEndpoints';
 import { walletAliasMappingService } from './walletAliasService';
 import transactionRouter from './transactionEndpoints';
@@ -186,6 +185,412 @@ void walletAliasMappingService.loadFromDatabase().catch((error) => {
     error: error instanceof Error ? error.message : String(error),
   });
 });
+
+// Health check cache to track dependency status
+const cache = new NodeCache({ stdTTL: 30 });
+
+type VaultHealthResponse = {
+  vaultId: string;
+  status: 'healthy' | 'degraded';
+  uptimeSeconds: number;
+  metrics: {
+    totalAssets: string;
+    totalShares: string;
+    sharePrice: string;
+    apy: number;
+  };
+  dependencies: Record<string, 'up' | 'down' | 'degraded'>;
+  cached: boolean;
+  timestamp: string;
+};
+
+/**
+ * Reads the vault summary from the VaultState table and the most recent
+ * SharePriceSnapshot for the share price. Falls back to zeroed values when
+ * the database is unavailable (e.g., during startup or in tests).
+ */
+async function buildVaultSummaryResponseFromDb(): Promise<{
+  totalAssets: string;
+  totalShares: string;
+  sharePrice: string;
+  apy: number;
+  timestamp: string;
+}> {
+  try {
+    const prismaClient = getPrismaClient();
+    const [vaultState, latestSnapshot] = await Promise.all([
+      prismaClient.vaultState.findUnique({ where: { id: 1 } }),
+      prismaClient.sharePriceSnapshot
+        .findFirst({ orderBy: { recordedAt: 'desc' } })
+        .catch(() => null),
+    ]);
+
+    const totalAssets = vaultState?.totalAssets ?? '0';
+    const totalShares = vaultState?.totalShares ?? '0';
+    const sharePrice = latestSnapshot?.sharePrice ?? '1.000000';
+
+    return {
+      totalAssets,
+      totalShares,
+      sharePrice,
+      apy: 0, // APY is computed by the nightly snapshot job; placeholder until first run
+      timestamp: new Date().toISOString(),
+    };
+  } catch {
+    // Fail-open: return safe zero values so the endpoint never 500s
+    return {
+      totalAssets: '0',
+      totalShares: '0',
+      sharePrice: '1.000000',
+      apy: 0,
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
+async function buildVaultHealthResponse(vaultId: string): Promise<VaultHealthResponse> {
+  const cacheKey = `vault-health:${vaultId}`;
+  const cached = cache.get<Omit<VaultHealthResponse, 'cached'>>(cacheKey);
+  if (cached) {
+    return { ...cached, cached: true };
+  }
+
+  const [summary, probes] = await Promise.all([
+    buildVaultSummaryResponseFromDb(),
+    healthProbeService.checkAll().catch(
+      () => ({}) as Record<string, { status: 'up' | 'down' | 'degraded' }>,
+    ),
+  ]);
+  const dependencies = Object.fromEntries(
+    Object.entries(probes).map(([name, state]) => [name, state.status]),
+  ) as Record<string, 'up' | 'down' | 'degraded'>;
+  const degraded = Object.values(dependencies).some((state) => state !== 'up');
+  const body = {
+    vaultId,
+    status: degraded ? 'degraded' as const : 'healthy' as const,
+    uptimeSeconds: Math.floor(process.uptime()),
+    metrics: {
+      totalAssets: summary.totalAssets,
+      totalShares: summary.totalShares,
+      sharePrice: summary.sharePrice,
+      apy: summary.apy,
+    },
+    dependencies,
+    timestamp: new Date().toISOString(),
+  };
+
+  cache.set(cacheKey, body, 5);
+  return { ...body, cached: false };
+}
+
+function resolveActingAdminAddress(req: Request): string {
+  const address =
+    req.get('x-admin-address') ||
+    req.get('x-admin-id') ||
+    req.get('x-wallet-address') ||
+    'unknown';
+  return address === 'unknown' ? address : normalizeWalletAddress(address);
+}
+
+function parseLimited(v: unknown, fallback: number, min: number, max: number): number {
+  const n = parseInt(String(v ?? ''), 10);
+  return Number.isNaN(n) ? fallback : Math.min(Math.max(n, min), max);
+}
+
+function isDryRunRequest(req: Request): boolean {
+  const value = req.body?.dryRun ?? req.query.dryRun;
+  return value === true || value === 'true' || value === '1';
+}
+
+function countInclusiveDays(start: string, end: string): number {
+  const startMs = Date.parse(start + 'T00:00:00.000Z');
+  const endMs = Date.parse(end + 'T00:00:00.000Z');
+  return Math.floor((endMs - startMs) / 86400000) + 1;
+}
+
+function paginateByLimit<T>(rows: T[], limit: number): { data: T[]; hasNextPage: boolean } {
+  const hasNextPage = rows.length > limit;
+  return {
+    data: hasNextPage ? rows.slice(0, limit) : rows,
+    hasNextPage,
+  };
+}
+
+function sendStandardListEnvelope<T>(
+  res: Response,
+  input: {
+    data: T[];
+    limit: number;
+    hasNextPage?: boolean;
+    hasPrevPage?: boolean;
+    nextCursor?: string;
+    total?: number;
+    statusCode?: number;
+    extras?: Record<string, unknown>;
+  },
+): void {
+  const payload = createPaginatedResponse(input.data, {
+    count: input.data.length,
+    total: input.total ?? input.data.length,
+    nextCursor: input.nextCursor ?? null,
+    prevCursor: null,
+    currentPage: null,
+    totalPages: null,
+    hasNextPage: input.hasNextPage ?? false,
+    hasPrevPage: input.hasPrevPage ?? false,
+    limit: input.limit,
+  });
+
+  res.status(input.statusCode ?? 200).json({
+    ...payload,
+    ...(input.extras || {}),
+  });
+}
+
+async function buildReferralStatsSnapshot(wallet: string) {
+  const normalizedWallet = normalizeWalletAddress(wallet);
+
+  try {
+    const stats = await referralService.getReferralStats(normalizedWallet);
+
+    if (!stats) {
+      // Must be the exact envelope GET /api/v1/referrals/:wallet returns, not
+      // a hand-rolled stand-in — admin impersonation is compared against that
+      // endpoint field-for-field by the governance contract test.
+      return {
+        statusCode: 404,
+        body: buildReferralStatsNotFoundBody(),
+      };
+    }
+
+    return {
+      statusCode: 200,
+      body: stats,
+    };
+  } catch (error) {
+    // Same reasoning as the 404 above. The route reports a failed lookup as a
+    // 500 with the canonical envelope; letting the rejection escape instead
+    // would 500 the entire impersonation response with a different message, so
+    // one broken sub-resource would take the whole snapshot with it (#1319).
+    logger.log('error', 'Error building referral stats snapshot', {
+      error: error instanceof Error ? error.message : String(error),
+      wallet: normalizedWallet,
+    });
+    return {
+      statusCode: 500,
+      body: buildReferralStatsErrorBody(),
+    };
+  }
+}
+
+async function buildReferralCodeSnapshot(wallet: string) {
+  const normalizedWallet = normalizeWalletAddress(wallet);
+
+  try {
+    const code = await referralService.getOrCreateReferralCode(normalizedWallet);
+    return {
+      statusCode: 200,
+      body: { code },
+    };
+  } catch (error) {
+    logger.log('error', 'Error building referral code snapshot', {
+      error: error instanceof Error ? error.message : String(error),
+      wallet: normalizedWallet,
+    });
+    return {
+      statusCode: 500,
+      body: buildReferralCodeErrorBody(),
+    };
+  }
+}
+
+async function buildWalletTransactionsSnapshot(wallet: string) {
+  const normalizedWallet = normalizeWalletAddress(wallet);
+  const prisma = getPrismaClient();
+  // Shared with GET /api/v1/transactions so the proxy can never drift to a
+  // different page size than the endpoint it stands in for (#1322).
+  const limit = TRANSACTION_PAGINATION_CONFIG.defaultLimit ?? 20;
+  const where = { user: normalizedWallet };
+  const [total, transactions] = await Promise.all([
+    prisma.transaction.count({ where }),
+    prisma.transaction.findMany({
+      where,
+      orderBy: { timestamp: 'desc' },
+      take: limit + 1,
+    }),
+  ]);
+  const hasNextPage = transactions.length > limit;
+  const data = hasNextPage ? transactions.slice(0, limit) : transactions;
+
+  return createPaginatedResponse(
+    data,
+    createPaginationEnvelope({
+      count: data.length,
+      limit,
+      total,
+      hasNextPage,
+      hasPrevPage: false,
+      nextCursor: hasNextPage && data.length > 0 ? encodeCursor(data[data.length - 1].id) : null,
+    }),
+  );
+}
+
+async function buildImpersonatedVaultState(wallet: string) {
+  const normalizedWallet = normalizeWalletAddress(wallet);
+  return {
+    walletAddress: normalizedWallet,
+    // Impersonation must show an admin exactly what the wallet's own
+    // dashboard would show, so read the same DB-backed summary
+    // GET /api/v1/vault/summary serves.
+    summary: await buildVaultSummaryResponseFromDb(),
+    transactions: await buildWalletTransactionsSnapshot(normalizedWallet),
+    portfolioHoldings: buildPortfolioHoldingsResponse({ walletAddress: normalizedWallet }),
+    vaultHistory: buildVaultHistoryResponse({}),
+    referralStats: await buildReferralStatsSnapshot(normalizedWallet),
+    referralCode: await buildReferralCodeSnapshot(normalizedWallet),
+  };
+}
+
+function resolveTransactionExportAccess(req: Request):
+  | { kind: 'admin'; walletAddress?: string }
+  | { kind: 'user'; walletAddress: string }
+  | null {
+  const authHeader = req.get('authorization') || '';
+  const walletAddress =
+    typeof req.query.walletAddress === 'string' ? normalizeWalletAddress(req.query.walletAddress) : undefined;
+
+  const apiKeyMatch = authHeader.match(/^ApiKey\s+(.+)$/i);
+  if (apiKeyMatch) {
+    const authenticated = authenticateApiKeyValue(apiKeyMatch[1]);
+    if (!authenticated) {
+      return null;
+    }
+    req.authApiKeyHash = authenticated.hash;
+    req.authApiKeyRole = authenticated.role;
+    return {
+      kind: 'admin',
+      walletAddress: walletAddress || undefined,
+    };
+  }
+
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!bearerMatch) {
+    return null;
+  }
+
+  const payload = verifyJwt(bearerMatch[1]);
+  const userWallet = normalizeWalletAddress(payload.sub);
+  if (walletAddress && walletAddress !== userWallet) {
+    throw new Error('FORBIDDEN_WALLET_EXPORT');
+  }
+
+  return {
+    kind: 'user',
+    walletAddress: userWallet,
+  };
+}
+
+function buildTransactionExportFilename(format: 'csv' | 'json'): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `transaction-history-${timestamp}.${format}`;
+}
+
+async function handleTransactionExport(req: Request, res: Response): Promise<void> {
+  const format = req.query.format === 'csv' ? 'csv' : req.query.format === 'json' ? 'json' : null;
+  if (!format) {
+    res.status(400).json({
+      error: 'Bad Request',
+      status: 400,
+      message: 'format query parameter must be either csv or json',
+    });
+    return;
+  }
+
+  let access;
+  try {
+    access = resolveTransactionExportAccess(req);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'FORBIDDEN_WALLET_EXPORT') {
+      res.status(403).json({
+        error: 'Forbidden',
+        status: 403,
+        message: 'Users may only export their own wallet transactions',
+      });
+      return;
+    }
+
+    res.status(401).json({
+      error: 'Unauthorized',
+      status: 401,
+      message: error instanceof Error ? error.message : 'Invalid authorization header',
+    });
+    return;
+  }
+
+  if (!access) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      status: 401,
+      message: 'Authorization header must contain a Bearer token or ApiKey',
+    });
+    return;
+  }
+
+  const exportQuery = {
+    type: typeof req.query.type === 'string' ? req.query.type : undefined,
+    status: typeof req.query.status === 'string' ? req.query.status : undefined,
+    sortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+    sortOrder: (
+      req.query.sortOrder === 'asc' || req.query.sortOrder === 'desc'
+        ? req.query.sortOrder
+        : undefined
+    ) as 'asc' | 'desc' | undefined,
+    walletAddress: access.walletAddress,
+    startDate: typeof req.query.startDate === 'string' ? req.query.startDate : undefined,
+    endDate: typeof req.query.endDate === 'string' ? req.query.endDate : undefined,
+  };
+
+  try {
+    const artifact = await buildTransactionExportArtifact(format, exportQuery);
+    const fileName = buildTransactionExportFilename(format);
+    const job = await recordExportJob({
+      format,
+      fileName,
+      contentType: artifact.contentType,
+      checksum: artifact.checksum,
+      checksumAlgorithm: artifact.checksumAlgorithm,
+      generatedBy: resolveExportGeneratedBy(req),
+      walletAddress: access.walletAddress,
+      rowCount: artifact.rowCount,
+      filters: {
+        type: exportQuery.type || null,
+        status: exportQuery.status || null,
+        sortBy: exportQuery.sortBy || null,
+        sortOrder: exportQuery.sortOrder || null,
+        startDate: exportQuery.startDate || null,
+        endDate: exportQuery.endDate || null,
+        walletAddress: exportQuery.walletAddress || null,
+      },
+    });
+
+    res.setHeader('Content-Type', artifact.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('X-Export-Job-Id', job.id);
+    res.setHeader('X-Export-Checksum', artifact.checksum);
+    res.setHeader('X-Export-Checksum-Algorithm', artifact.checksumAlgorithm);
+    res.setHeader('X-Export-Metadata', buildExportMetadataHeaderValue(job));
+    res.status(200).send(artifact.body);
+  } catch (error) {
+    logger.log('error', 'Transaction export failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      error: 'Internal Server Error',
+      status: 500,
+      message: 'Failed to generate transaction export',
+    });
+  }
+}
 
 // â”€â”€â”€ Rate Limiting Middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Issue #455: Use the Redis-backed limiter factory from rateLimiter.ts.
@@ -318,7 +723,28 @@ app.use(maintenanceModeMiddleware);
  * GET /metrics
  * Exposes Prometheus metrics for operational monitoring
  */
-app.get('/metrics', async (_req: Request, res: Response) => {
+app.get('/metrics', async (req: Request, res: Response) => {
+  const scrapeToken =
+    process.env.METRICS_AUTH_TOKEN ||
+    process.env.METRICS_SCRAPE_TOKEN ||
+    process.env.PROMETHEUS_BEARER_TOKEN;
+
+  if (scrapeToken) {
+    const authHeader = req.headers.authorization;
+    const apiKeyHeader = req.headers['x-api-key'] || req.headers['apikey'];
+    const bearerMatch = authHeader?.match(/^Bearer\s+(.+)$/i);
+    const apiKeyMatch = authHeader?.match(/^ApiKey\s+(.+)$/i);
+    const provided =
+      bearerMatch?.[1] ||
+      apiKeyMatch?.[1] ||
+      (typeof apiKeyHeader === 'string' ? apiKeyHeader : undefined);
+
+    if (!provided || provided !== scrapeToken) {
+      res.status(401).type('text/plain').send('Unauthorized');
+      return;
+    }
+  }
+
   try {
     syncJobGovernanceMetrics();
     latencyMonitoringService.syncSloMetrics();
@@ -342,7 +768,7 @@ app.get('/metrics', async (_req: Request, res: Response) => {
     res.set('Content-Type', register.contentType);
     res.end(await register.metrics());
   } catch (err) {
-    res.status(500).end(err);
+    res.status(500).type('text/plain').send(err instanceof Error ? err.message : String(err));
   }
 });
 
@@ -541,7 +967,6 @@ app.use('/api', createVersionDiscoveryRouter());
 
 // Mount routers under /api/v1
 apiV1.use('/vault', vaultRouter);
-apiV1.use('/vaults', vaultsListRouter);
 apiV1.use('/vaults', vaultListRouter);
 apiV1.use('/wallet-aliases', walletAliasRouter);
 apiV1.use('/referrals', referralRouter);
@@ -1515,11 +1940,27 @@ app.post('/admin/emails/replay/:id', validateApiKey, async (req: Request, res: R
       message: 'Email requeued successfully',
       email,
     });
-  } catch {
-    res.status(404).json({
-      error: 'Not Found',
-      status: 404,
-      message: 'Email queue item not found',
+  } catch (err: unknown) {
+    const isNotFound =
+      (err && typeof err === 'object' && 'code' in err && (err as { code: unknown }).code === 'P2025') ||
+      (err instanceof Error &&
+        (err.name === 'NotFoundError' ||
+          err.message.includes('No EmailQueue found') ||
+          err.message.includes('not found')));
+
+    if (isNotFound) {
+      sendApiError(req, res, {
+        status: 404,
+        code: 'EMAIL_NOT_FOUND',
+        message: 'Email queue item not found',
+      });
+      return;
+    }
+
+    sendApiError(req, res, {
+      status: 500,
+      code: 'INTERNAL_SERVER_ERROR',
+      message: err instanceof Error ? err.message : 'Failed to replay email',
     });
   }
 });

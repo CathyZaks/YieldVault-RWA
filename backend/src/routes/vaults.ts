@@ -22,6 +22,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { sendApiError } from '../middleware/apiError';
 import { readsLimiter } from '../rateLimiter';
 import { createTimeoutFor } from '../middleware/timeoutMiddleware';
 import {
@@ -142,8 +143,7 @@ router.get(
         logger.log('error', 'Failed to list vaults', {
           error: error instanceof Error ? error.message : String(error),
         });
-        res.status(500).json({
-          error: 'Internal Server Error',
+        sendApiError(req, res, {
           status: 500,
           code: 'VAULTS_LIST_FAILED',
           message: 'Failed to fetch vaults',

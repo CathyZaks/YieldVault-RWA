@@ -199,6 +199,10 @@ export function buildOutboxLeaseToken(
  * deep inside fire-and-forget writes, where callers only log it.
  */
 export function assertEventOutboxModelAvailable(client?: unknown): void {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { prisma } = require('./prisma') as typeof import('./prisma');
+  const c = client ?? prisma;
+  const delegate = (c as { eventOutbox?: { create?: unknown } } | null | undefined)?.eventOutbox;
   const resolved = client ?? getPrisma();
   const delegate = (resolved as { eventOutbox?: { create?: unknown } } | null | undefined)
     ?.eventOutbox;
@@ -249,7 +253,6 @@ class EventOutboxService {
         status: 'pending',
         aggregateType: input.aggregateType,
         aggregateId: input.aggregateId,
-        vaultId,
         sequence: await this.nextSequenceForVault(vaultId),
         attemptCount: 0,
         maxAttempts: input.maxAttempts ?? getMaxAttempts(),
@@ -299,11 +302,17 @@ class EventOutboxService {
       //    We select the head-of-line event per vault to enforce strict
       //    per-vault ordering (a vault's next event is only processed after
       //    its predecessor has been relayed or dead-lettered).
+      // 1. Find eligible entries: pending or failed entries whose lock is expired
       const candidates = await getEventOutboxDelegate().findMany({
         where: {
           status: { in: ['pending', 'failed'] },
           OR: [{ lockedAt: null }, { lockedAt: { lt: lockExpiry } }],
         },
+        orderBy: [
+          { aggregateId: 'asc' },
+          { sequence: 'asc' },
+          { createdAt: 'asc' },
+        ],
         orderBy: [{ vaultId: 'asc' }, { sequence: 'asc' }, { createdAt: 'asc' }],
         take: limit,
       });
@@ -317,6 +326,8 @@ class EventOutboxService {
       //     consumer tracking vault.version never observes sequence N+1
       //     before sequence N for the same vault.
       const headOfLine = new Map<string, (typeof candidates)[number]>();
+      for (const c of candidates) {
+        const key = c.aggregateId;
       for (const candidate of candidates) {
         const key = candidate.vaultId ?? candidate.aggregateId;
         const existing = headOfLine.get(key);
@@ -325,8 +336,8 @@ class EventOutboxService {
         }
       }
       const orderedCandidates = Array.from(headOfLine.values()).sort((a, b) => {
-        const va = a.vaultId ?? a.aggregateId;
-        const vb = b.vaultId ?? b.aggregateId;
+        const va = a.aggregateId;
+        const vb = b.aggregateId;
         if (va !== vb) return va < vb ? -1 : 1;
         return a.sequence - b.sequence;
       });
@@ -356,6 +367,11 @@ class EventOutboxService {
           lockedBy: this.instanceId,
           lockedAt: now,
         },
+        orderBy: [
+          { aggregateId: 'asc' },
+          { sequence: 'asc' },
+          { createdAt: 'asc' },
+        ],
         orderBy: [{ vaultId: 'asc' }, { sequence: 'asc' }, { createdAt: 'asc' }],
       });
 
@@ -939,6 +955,10 @@ class EventOutboxService {
    * Sequences are per-vault and increment by exactly 1.
    */
   private async nextSequenceForVault(vaultId: string): Promise<number> {
+    const latest = await getEventOutboxDelegate().findFirst({
+      where: { aggregateId: vaultId },
+      orderBy: { sequence: 'desc' },
+      select: { sequence: true },
     const result = await getPrisma().$transaction(async (tx) => {
       const latest = await tx.eventOutbox.findFirst({
         where: { vaultId },
@@ -947,7 +967,7 @@ class EventOutboxService {
       });
       return (latest?.sequence ?? 0) + 1;
     });
-    return result;
+    return (latest?.sequence ?? 0) + 1;
   }
 }
 

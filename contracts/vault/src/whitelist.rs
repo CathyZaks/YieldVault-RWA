@@ -266,6 +266,8 @@ mod tests {
             );
             assert_eq!(read_registration_state(&env, &active), Some(STATE_ACTIVE));
 
+            assert_eq!(SecureWhitelist::add_strategy(&env, &admin, &retired), Ok(()));
+            assert_eq!(retire_strategy_internal(&env, &retired, None), Ok(STATE_RETIRED));
             assert_eq!(
                 SecureWhitelist::add_strategy(&env, &admin, &retired),
                 Ok(())

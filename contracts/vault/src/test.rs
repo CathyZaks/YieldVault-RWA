@@ -2352,6 +2352,7 @@ fn test_whitelist_consistency_with_set_strategy() {
     assert_eq!(vault.strategy().unwrap(), benji_strategy);
 
     // Removal of the active vault strategy is rejected (#1637)
+    assert!(vault.try_whitelist_strategy(&benji_strategy, &false).is_err());
     assert!(vault
         .try_whitelist_strategy(&benji_strategy, &false)
         .is_err());

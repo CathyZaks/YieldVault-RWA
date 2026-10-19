@@ -127,6 +127,7 @@ export interface OutboxMetrics {
   deadLettered: number;
   locked: number;
   total: number;
+  oldestPendingAgeSeconds: number;
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -775,7 +776,7 @@ class EventOutboxService {
 
   /** Returns a snapshot of outbox metrics for monitoring/administration. */
   async getMetrics(): Promise<OutboxMetrics> {
-    const [pending, relayed, failed, deadLettered, locked, total] = await Promise.all([
+    const [pending, relayed, failed, deadLettered, locked, total, oldestPending] = await Promise.all([
       getEventOutboxDelegate().count({ where: { status: 'pending' } }),
       getEventOutboxDelegate().count({ where: { status: 'relayed' } }),
       getEventOutboxDelegate().count({ where: { status: 'failed' } }),
@@ -787,9 +788,24 @@ class EventOutboxService {
         },
       }),
       getEventOutboxDelegate().count(),
+      getEventOutboxDelegate().findFirst({
+        where: { status: { in: ['pending', 'failed'] } },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
     ]);
 
-    return { pending, relayed, failed, deadLettered, locked, total };
+    return {
+      pending,
+      relayed,
+      failed,
+      deadLettered,
+      locked,
+      total,
+      oldestPendingAgeSeconds: oldestPending
+        ? Math.max(0, (Date.now() - new Date(oldestPending.createdAt).getTime()) / 1000)
+        : 0,
+    };
   }
 
   /** Lists outbox entries with optional filters. */

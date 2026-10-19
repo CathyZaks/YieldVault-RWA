@@ -103,7 +103,7 @@ jobs:
             ${{ runner.os }}-cargo-fuzz-
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@cargo-fuzz
 
       - name: Run share_price_math fuzz target
         run: |
@@ -184,6 +184,9 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
           node-version-file: '.nvmrc'
 
       - name: Install root dependencies

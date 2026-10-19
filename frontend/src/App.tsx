@@ -46,7 +46,10 @@ import {
   LazyTransactionHistory,
   LazyUIPreview,
   LazyVaultComparison,
+  LazyVaultHealth,
+  observeLcp,
   prefetchDashboardRoutes,
+  recordRouteNavigation,
 } from "./lib/routePrefetch";
 import NetworkBannerStack from "./components/NetworkBannerStack";
 import { useVault, VaultProvider } from "./context/VaultContext";
@@ -60,7 +63,6 @@ const SentryRoutes = Sentry.withSentryReactRouterV6Routing(Routes);
 const TransactionReceipt = lazy(() => import("./pages/TransactionReceipt"));
 const StrategyDetail = lazy(() => import("./pages/StrategyDetail"));
 const Admin = lazy(() => import("./pages/Admin"));
-const VaultHealthDashboard = lazy(() => import("./pages/VaultHealthDashboard"));
 const AuditLog = lazy(() => import("./pages/AuditLog"));
 
 // Removed simple fallback in favor of components/ErrorFallback
@@ -110,6 +112,15 @@ function AppContent() {
 
     const timeoutId = globalThis.setTimeout(schedulePrefetch, 1500);
     return () => globalThis.clearTimeout(timeoutId);
+  }, [location.pathname]);
+
+  // Observe Largest Contentful Paint and record each navigation together with
+  // its prefetch status. Comparing warm vs cold samples is how the issue's LCP
+  // improvement is measured in the field.
+  useEffect(() => observeLcp(), []);
+
+  useEffect(() => {
+    recordRouteNavigation(location.pathname);
   }, [location.pathname]);
 
   const handleConnect = useCallback((address: string) => {
@@ -275,7 +286,7 @@ function AppContent() {
                   path="/vault-health"
                   element={
                     <RouteErrorBoundary routeName="vault-health">
-                      <VaultHealthDashboard />
+                      <LazyVaultHealth />
                     </RouteErrorBoundary>
                   }
                 />

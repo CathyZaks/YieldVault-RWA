@@ -2,15 +2,16 @@ import crypto from 'crypto';
 import { prisma } from './prisma';
 import { logger } from './middleware/structuredLogging';
 
-export type JobName = 'priceRefresh' | 'positionReconciliation' | 'reportGeneration' | 'databaseBackup' | 'apySnapshot';
+export type JobName = 'priceRefresh' | 'positionReconciliation' | 'reportGeneration' | 'databaseBackup' | 'apySnapshot' | 'vaultRebalance' | 'yieldAccrual';
 
-export type DeadLetterStatus = 'dead-letter' | 'processing' | 'resolved' | 'requeued' | 'discarded';
+export type DeadLetterStatus = 'dead-letter' | 'processing' | 'resolved' | 'requeued' | 'discarded' | 'needs_retry';
 
 export interface JobPolicy {
   maxAttempts: number;
   baseDelayMs: number;
   backoffMultiplier: number;
   deadLetterThreshold: number;
+  timeoutMs?: number;
 }
 
 export interface DeadLetterRecord {
@@ -47,28 +48,49 @@ export const JOB_POLICIES: Record<JobName, JobPolicy> = {
     baseDelayMs: 1000,
     backoffMultiplier: 2,
     deadLetterThreshold: 3,
+    timeoutMs: 10000,
   },
   positionReconciliation: {
     maxAttempts: 4,
     baseDelayMs: 2000,
     backoffMultiplier: 2,
     deadLetterThreshold: 2,
+    timeoutMs: 30000,
   },
   reportGeneration: {
     maxAttempts: 5,
     baseDelayMs: 5000,
     backoffMultiplier: 2,
     deadLetterThreshold: 2,
+    timeoutMs: 60000,
   },
   databaseBackup: {
     maxAttempts: 3,
     baseDelayMs: 10000,
     backoffMultiplier: 2,
     deadLetterThreshold: 2,
+    timeoutMs: 120000,
   },
   apySnapshot: {
     maxAttempts: 3,
     baseDelayMs: 1000,
+    backoffMultiplier: 2,
+    deadLetterThreshold: 3,
+    timeoutMs: 15000,
+  },
+  // vaultRebalance uses a generous retry policy because timeouts are transient
+  // under load and a successful rebalance requires all allocation rows to commit
+  // atomically. See: .kiro/specs/prisma-rebalance-timeout/design.md
+  vaultRebalance: {
+    maxAttempts: 3,
+    baseDelayMs: 5000,
+    backoffMultiplier: 2,
+    deadLetterThreshold: 2,
+    timeoutMs: 30000,
+  },
+  yieldAccrual: {
+    maxAttempts: 3,
+    baseDelayMs: 2000,
     backoffMultiplier: 2,
     deadLetterThreshold: 3,
   },
@@ -118,9 +140,14 @@ class JobGovernanceStore {
       }
 
       this.initialized = true;
-      console.log(`Loaded ${persistedRecords.length} dead-letter records from database`);
+      logger.log('info', 'Loaded dead-letter records from database', {
+        count: persistedRecords.length,
+      });
     } catch (error) {
-      console.error('Failed to initialize dead-letter records from database:', error);
+      logger.log('error', 'Failed to initialize dead-letter records from database', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       this.initialized = true; // Mark as initialized anyway to avoid retries
     }
   }
@@ -176,7 +203,10 @@ class JobGovernanceStore {
     this.failureCounts.set(fullRecord.jobName, failures);
 
     if (failures >= JOB_POLICIES[fullRecord.jobName].deadLetterThreshold) {
-      console.warn(`Recurring failures detected for ${fullRecord.jobName}: ${failures}`);
+      logger.log('warn', 'Recurring job failures detected', {
+        jobName: fullRecord.jobName,
+        failures,
+      });
       // Fire-and-forget alert
       void this.sendDeadLetterAlert(fullRecord.jobName, failures, fullRecord.error);
     }
@@ -205,7 +235,11 @@ class JobGovernanceStore {
         },
       });
     } catch (error) {
-      console.error('Failed to persist dead-letter record to database:', error);
+      logger.log('error', 'Failed to persist dead-letter record to database', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        jobName: record.jobName,
+      });
       // Continue operation even if persistence fails
     }
   }
@@ -218,6 +252,7 @@ class JobGovernanceStore {
       await fetch(webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(10000),
         body: JSON.stringify({
           text: `:rotating_light: *YieldVault Job Dead-Lettered*\nJob \`${jobName}\` reached dead-letter threshold with ${failures} failures.\nLatest error: \`${error}\``
         })
@@ -318,7 +353,11 @@ class JobGovernanceStore {
         },
       });
     } catch (error) {
-      console.error('Failed to update dead-letter record in database:', error);
+      logger.log('error', 'Failed to update dead-letter record in database', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        id,
+      });
     }
   }
 
@@ -479,7 +518,23 @@ export async function runJobWithRetry<T>(
 
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
     try {
-      const result = await task();
+      let result: T;
+      const timeoutMs = policy.timeoutMs;
+      if (timeoutMs && timeoutMs > 0) {
+        let timer: NodeJS.Timeout | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Job ${jobName} timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        try {
+          result = await Promise.race([task(), timeoutPromise]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      } else {
+        result = await task();
+      }
       jobGovernanceStore.markCompleted(jobName, Date.now() - startedAt, true);
       return result;
     } catch (error) {

@@ -158,6 +158,25 @@ export class EmailQueueService {
     });
   }
 
+  async getQueueMetrics(): Promise<{ pending: number; oldestPendingAgeSeconds: number }> {
+    const where = { status: { in: ['pending', 'failed'] } };
+    const [pending, oldestPending] = await Promise.all([
+      this.queueDelegate.count({ where }),
+      this.queueDelegate.findFirst({
+        where,
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+    ]);
+
+    return {
+      pending,
+      oldestPendingAgeSeconds: oldestPending?.createdAt
+        ? Math.max(0, (Date.now() - new Date(oldestPending.createdAt).getTime()) / 1000)
+        : 0,
+    };
+  }
+
   async replayEmail(emailId: string): Promise<EmailQueueItem> {
     await this.queueDelegate.findUniqueOrThrow({
       where: { id: emailId },
@@ -182,6 +201,7 @@ export class EmailQueueService {
       await fetch(webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(10000),
         body: JSON.stringify({
           text: `:rotating_light: *YieldVault Email Dead-Lettered*\nFailed to send email to \`${toAddress}\` (ID: ${emailId}).\nLatest error: \`${error}\``
         })

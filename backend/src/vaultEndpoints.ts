@@ -3,7 +3,7 @@ import { emailService } from './emailService';
 import { logger } from './middleware/structuredLogging';
 import { allowlistMiddleware } from './middleware/allowlist';
 import { triggerCacheInvalidation, registerInvalidationHook } from './middleware/cache';
-import { depositsLimiter, depositsUserLimiter } from './rateLimiter';
+import { depositsLimiter, depositsUserLimiter, readsLimiter } from './rateLimiter';
 import { cacheMiddleware } from './middleware/cache';
 import {
   idempotencyStore,
@@ -12,6 +12,7 @@ import {
 } from './idempotency';
 import { sorobanCircuitBreaker, CircuitOpenError } from './circuitBreaker';
 import { withSpan, getCurrentTraceId } from './tracing';
+import { context, propagation, trace } from '@opentelemetry/api';
 import { submitVaultOperation, SorobanSimulationError } from './sorobanClient';
 import { requireFlag } from './featureFlags';
 import { referralService } from './referralService';
@@ -27,32 +28,39 @@ import {
 import { withdrawalDailyLimitMiddleware } from './middleware/withdrawalDailyLimit';
 import { requireSignedWalletAction } from './middleware/walletSignedAction';
 import { createTimeoutFor } from './middleware/timeoutMiddleware';
+import { sendApiError } from './middleware/apiError';
+import { authenticateApiKeyValue, hashApiKey } from './middleware/apiKeyAuth';
+import { walletNonceService } from './walletNonce';
+import { verifyWalletActionSignature } from './walletSignature';
+import { redisCacheClient } from './redisCache';
 import crypto from 'crypto';
 // crypto is still used below for generateFingerprint and body.id generation.
 import { tryAcquireWalletLock } from './walletLock';
 import { normalizeWalletAddress } from './walletUtils';
+import { clampLimitNumber, type PaginationConfig } from './pagination';
 import { recordVaultLifecycleEvent } from './vaultAuditLog';
-import {
-  registerWithdrawalPlan,
-  withdrawalRecoveryCoordinator,
-} from './withdrawalRecovery';
+import { registerWithdrawalPlan, withdrawalRecoveryCoordinator } from './withdrawalRecovery';
 import Decimal from 'decimal.js';
 
-const EXPLORER_BASE_URL = process.env.STELLAR_EXPLORER_URL || 'https://stellar.expert/explorer/testnet/tx';
+const EXPLORER_BASE_URL =
+  process.env.STELLAR_EXPLORER_URL || 'https://stellar.expert/explorer/testnet/tx';
 
 const router = Router();
+const prisma = getPrismaClient();
 const ZERO = new Decimal(0);
 const DEFAULT_SHARE_PRICE = new Decimal(1);
 const STRATEGY_CACHE_TTL_MS = parseInt(process.env.CACHE_STRATEGY_TTL_MS || '30000', 10);
 
+/** Page size bounds for GET /receipts; see clampLimitNumber for the semantics. */
+const RECEIPTS_PAGINATION_CONFIG: Partial<PaginationConfig> = {
+  defaultLimit: 50,
+  maxLimit: 100,
+};
+
 // Register cache invalidation hooks for transaction state changes
 registerInvalidationHook((eventType) => {
   if (eventType.startsWith('transaction.')) {
-    return [
-      'GET:/api/v1/vault',
-      'GET:/api/v1/transactions',
-      'GET:/api/v1/portfolio',
-    ];
+    return ['GET:/api/v1/vault', 'GET:/api/v1/transactions', 'GET:/api/v1/portfolio'];
   }
   return [];
 });
@@ -80,16 +88,16 @@ async function submitSorobanTx(type: string, payload: Record<string, unknown>): 
         type as 'deposit' | 'withdrawal',
         String(payload.walletAddress),
         String(payload.amount),
-        String(payload.asset),
+        String(payload.asset)
       );
-    }),
+    })
   );
 }
 
 async function updateVaultStateAndSnapshot(
   type: 'deposit' | 'withdrawal',
   amountRaw: string,
-  recordedAt: Date,
+  recordedAt: Date
 ): Promise<void> {
   const prisma = getPrismaClient();
   const amount = new Decimal(amountRaw);
@@ -98,9 +106,10 @@ async function updateVaultStateAndSnapshot(
     const existing = await tx.vaultState.findUnique({ where: { id: 1 } });
     const currentAssets = existing ? new Decimal(existing.totalAssets) : ZERO;
     const currentShares = existing ? new Decimal(existing.totalShares) : ZERO;
-    const currentSharePrice = currentAssets.gt(0) && currentShares.gt(0)
-      ? currentAssets.div(currentShares)
-      : DEFAULT_SHARE_PRICE;
+    const currentSharePrice =
+      currentAssets.gt(0) && currentShares.gt(0)
+        ? currentAssets.div(currentShares)
+        : DEFAULT_SHARE_PRICE;
 
     let nextAssets = currentAssets;
     let nextShares = currentShares;
@@ -128,9 +137,8 @@ async function updateVaultStateAndSnapshot(
       },
     });
 
-    const resultingSharePrice = nextAssets.gt(0) && nextShares.gt(0)
-      ? nextAssets.div(nextShares)
-      : DEFAULT_SHARE_PRICE;
+    const resultingSharePrice =
+      nextAssets.gt(0) && nextShares.gt(0) ? nextAssets.div(nextShares) : DEFAULT_SHARE_PRICE;
 
     await tx.sharePriceSnapshot.create({
       data: {
@@ -248,8 +256,8 @@ registerWithdrawalPlan(WITHDRAWAL_PLAN, [
 async function handleVaultOperation(
   req: Request,
   res: Response,
-  type: 'deposit' | 'withdrawal',
-): Promise<Response> {
+  type: 'deposit' | 'withdrawal'
+): Promise<Response | void> {
   // Task 3: read Idempotency-Key header (spec-compliant name)
   const idempotencyKey =
     (req.headers['idempotency-key'] as string | undefined) ||
@@ -266,13 +274,13 @@ async function handleVaultOperation(
   const withdrawalId = idempotencyKey || `wd-${crypto.randomBytes(12).toString('hex')}`;
 
   if (!walletLock.acquired) {
-    return res.status(409).json({
-      error: 'Conflict',
+    sendApiError(req, res, {
       status: 409,
       code: 'WALLET_OPERATION_IN_PROGRESS',
       message: 'Another operation is already in progress for this wallet',
-      walletAddress: normalizedWallet,
+      details: { walletAddress: normalizedWallet },
     });
+    return;
   }
 
   // Audit: the vault operation has been accepted and is about to be attempted.
@@ -323,9 +331,7 @@ async function handleVaultOperation(
             // is false. Acknowledge the withdrawal and hand back a recovery
             // handle instead.
             const sagaTxHash =
-              typeof outcome.saga.state.txHash === 'string'
-                ? outcome.saga.state.txHash
-                : undefined;
+              typeof outcome.saga.state.txHash === 'string' ? outcome.saga.state.txHash : undefined;
 
             recordVaultLifecycleEvent({
               operation: 'withdrawal',
@@ -461,6 +467,16 @@ async function handleVaultOperation(
         type === 'deposit' ? 'transaction.deposit.created' : 'transaction.withdrawal.created';
       const vaultEventType: TransactionEventType =
         type === 'deposit' ? 'vault.deposit.created' : 'vault.withdrawal.created';
+      const activeContext = context.active();
+      const carrier: Record<string, string> = {};
+      propagation.inject(activeContext, carrier);
+      const spanContext = trace.getSpan(activeContext)?.spanContext();
+      const traceMetadata =
+        spanContext &&
+        spanContext.traceId !== '00000000000000000000000000000000' &&
+        spanContext.spanId !== '0000000000000000'
+          ? { trace: { traceId: spanContext.traceId, spanId: spanContext.spanId } }
+          : undefined;
       const webhookPayload = {
         transactionId: body.id,
         amount: String(body.amount),
@@ -470,44 +486,54 @@ async function handleVaultOperation(
         status: String(body.status),
         timestamp: String(body.timestamp),
         vaultId: 'primary',
+        ...(traceMetadata ? { metadata: traceMetadata } : {}),
       };
-      void eventOutboxService.writeEvent({
-        eventType,
-        payload: webhookPayload,
-        aggregateType: 'transaction',
-        aggregateId: body.id,
-      }).catch((error) => {
-        logger.log('error', 'Failed to write event to outbox', {
-          error: error instanceof Error ? error.message : String(error),
-          eventType,
-          transactionId: body.id,
+      void context
+        .with(activeContext, () =>
+          eventOutboxService.writeEvent({
+            eventType,
+            payload: webhookPayload,
+            aggregateType: 'transaction',
+            aggregateId: body.id,
+          })
+        )
+        .catch((error) => {
+          logger.log('error', 'Failed to write event to outbox', {
+            error: error instanceof Error ? error.message : String(error),
+            eventType,
+            transactionId: body.id,
+          });
         });
-      });
-      void eventOutboxService.writeEvent({
-        eventType: vaultEventType,
-        payload: webhookPayload,
-        aggregateType: 'vault',
-        aggregateId: 'primary',
-      }).catch((error) => {
-        logger.log('error', 'Failed to write vault event to outbox', {
-          error: error instanceof Error ? error.message : String(error),
-          eventType: vaultEventType,
-          transactionId: body.id,
+      void context
+        .with(activeContext, () =>
+          eventOutboxService.writeEvent({
+            eventType: vaultEventType,
+            payload: webhookPayload,
+            aggregateType: 'vault',
+            aggregateId: 'primary',
+          })
+        )
+        .catch((error) => {
+          logger.log('error', 'Failed to write vault event to outbox', {
+            error: error instanceof Error ? error.message : String(error),
+            eventType: vaultEventType,
+            transactionId: body.id,
+          });
         });
-      });
 
       span.setAttributes({ 'vault.txHash': txHash });
 
       // Post-confirmation email (fire-and-forget)
-      const schedulePostConfirmation = process.env.NODE_ENV === 'test'
-        ? (fn: () => Promise<void>) => {
-            void fn();
-          }
-        : (fn: () => Promise<void>) => {
-            setTimeout(() => {
+      const schedulePostConfirmation =
+        process.env.NODE_ENV === 'test'
+          ? (fn: () => Promise<void>) => {
               void fn();
-            }, 100);
-          };
+            }
+          : (fn: () => Promise<void>) => {
+              setTimeout(() => {
+                void fn();
+              }, 100);
+            };
 
       schedulePostConfirmation(async () => {
         try {
@@ -552,7 +578,7 @@ async function handleVaultOperation(
       const { result, replayed } = await idempotencyStore.execute(
         idempotencyKey,
         fingerprint,
-        operation,
+        operation
       );
       if (replayed) res.setHeader('idempotency-status', 'replayed');
       // Trigger adaptive cache invalidation via hooks
@@ -595,42 +621,44 @@ async function handleVaultOperation(
     });
 
     if (err instanceof IdempotencyConflictError) {
-      return res.status(409).json({
-        error: 'Conflict',
+      sendApiError(req, res, {
         status: 409,
+        code: 'IDEMPOTENCY_CONFLICT',
         message: err.message,
       });
+      return;
     }
 
     if (err instanceof CircuitOpenError) {
       const retryAfterSec = Math.ceil(err.retryAfterMs / 1000);
-      res.setHeader('Retry-After', String(retryAfterSec));
-      return res.status(503).json({
-        error: 'Service Unavailable',
+      sendApiError(req, res, {
         status: 503,
+        code: 'CIRCUIT_OPEN',
         message: 'Soroban RPC is temporarily unavailable. Please retry later.',
-        retryAfterMs: err.retryAfterMs,
+        retryAfterSeconds: retryAfterSec,
       });
+      return;
     }
 
     if (err instanceof SorobanSimulationError) {
-      return res.status(err.statusCode).json({
-        error: err.statusCode === 422 ? 'Unprocessable Entity' : 'Bad Gateway',
+      sendApiError(req, res, {
         status: err.statusCode,
         code: err.code,
         message: err.message,
       });
+      return;
     }
 
     logger.log('error', `${type} operation failed`, {
       error: err instanceof Error ? err.message : String(err),
       traceId: getCurrentTraceId(),
     });
-    return res.status(500).json({
-      error: 'Internal Server Error',
+    sendApiError(req, res, {
       status: 500,
+      code: 'VAULT_OPERATION_FAILED',
       message: `Failed to process ${type}`,
     });
+    return;
   } finally {
     walletLock.release();
   }
@@ -650,7 +678,7 @@ router.post(
   allowlistMiddleware,
   validate({ body: VaultDepositBodySchema }),
   createTimeoutFor.write(),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit'),
+  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit')
 );
 
 /**
@@ -668,7 +696,7 @@ router.post(
   validate({ body: VaultWithdrawalBodySchema }),
   withdrawalDailyLimitMiddleware(),
   createTimeoutFor.write(),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'withdrawal'),
+  (req: Request, res: Response) => handleVaultOperation(req, res, 'withdrawal')
 );
 
 // ─── Feature-flagged v2 endpoints ────────────────────────────────────────────
@@ -686,23 +714,154 @@ router.post(
   depositsUserLimiter,
   requireFlag('deposit-v2'),
   validate({ body: VaultDepositBodySchema }),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit'),
+  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit')
 );
 
 /**
  * POST /api/v1/vault/strategy
  * Gated behind the "strategy-selection" feature flag.
  */
-router.get('/strategy', cacheMiddleware({ ttl: STRATEGY_CACHE_TTL_MS }), (_req: Request, res: Response) => {
-  res.status(200).json({
-    message: 'Strategy selection endpoint (v2 preview)',
-    timestamp: new Date().toISOString(),
-  });
-});
+router.get(
+  '/strategy',
+  cacheMiddleware({ ttl: STRATEGY_CACHE_TTL_MS }),
+  (_req: Request, res: Response) => {
+    res.status(200).json({
+      message: 'Strategy selection endpoint (v2 preview)',
+      timestamp: new Date().toISOString(),
+    });
+  }
+);
 
-router.get('/strategy/cooldown', cacheMiddleware({ ttl: 5000 }), (_req: Request, res: Response) => {
+async function getLastStrategySwitchTime(): Promise<string | null> {
+  if (redisCacheClient.isReady) {
+    try {
+      const cached = await redisCacheClient.get('vault:strategy:last_switch');
+      if (cached && typeof cached === 'string') return cached;
+    } catch {}
+  }
+  try {
+    const record = await prisma.adminConfigChange.findFirst({
+      where: { configType: 'vault.strategy', action: 'switch' },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    });
+    if (record) {
+      return record.createdAt.toISOString();
+    }
+  } catch {}
+  return null;
+}
+
+async function recordStrategySwitchTime(
+  actor: string,
+  strategyId: string,
+  previousStrategyId?: string,
+): Promise<string> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  if (redisCacheClient.isReady) {
+    try {
+      await redisCacheClient.set('vault:strategy:last_switch', nowIso as any, 24 * 60 * 60 * 1000);
+    } catch {}
+  }
+  try {
+    await prisma.adminConfigChange.create({
+      data: {
+        configType: 'vault.strategy',
+        action: 'switch',
+        actor: actor || 'unknown',
+        preChangeSnapshot: previousStrategyId || '',
+        postChangeSnapshot: strategyId,
+        metadata: JSON.stringify({ strategyId, previousStrategyId, timestamp: nowIso }),
+        createdAt: now,
+      },
+    });
+  } catch (err) {
+    logger.log('error', 'Failed to record strategy switch config change', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return nowIso;
+}
+
+async function requireStrategyAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const authHeader = req.get('Authorization') || req.get('authorization') || '';
+  const apiKeyHeader = req.get('x-api-key');
+  let providedKey = apiKeyHeader;
+  const match = authHeader.match(/^ApiKey\s+(.+)$/i) || authHeader.match(/^Bearer\s+(.+)$/i);
+  if (match) {
+    providedKey = match[1];
+  }
+
+  if (providedKey) {
+    const inMem = authenticateApiKeyValue(providedKey);
+    if (inMem && (inMem.role === 'admin' || inMem.role === 'super-admin')) {
+      req.authApiKeyRole = inMem.role;
+      return next();
+    }
+    try {
+      const hashed = hashApiKey(providedKey);
+      const dbKey = await prisma.apiKey.findUnique({
+        where: { hashedKey: hashed },
+      });
+      if (
+        dbKey &&
+        dbKey.isActive &&
+        !dbKey.deletedAt &&
+        (dbKey.role === 'admin' || dbKey.role === 'super-admin')
+      ) {
+        req.authApiKeyRole = dbKey.role as any;
+        return next();
+      }
+    } catch {}
+    sendApiError(req, res, {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+      message: 'Invalid admin API key for strategy switch',
+    });
+    return;
+  }
+
+  const body = req.body || {};
+  const { walletAddress, nonce, signature } = body;
+  if (walletAddress && nonce && signature) {
+    try {
+      const meta = await walletNonceService.validateForUse(walletAddress, 'strategy', nonce);
+      verifyWalletActionSignature({
+        walletAddress,
+        action: 'strategy',
+        nonce: meta.nonce,
+        issuedAt: meta.issuedAt,
+        expiresAt: meta.expiresAt,
+        signature,
+      });
+      await walletNonceService.consume(walletAddress, 'strategy', nonce);
+      req.body.walletAddress = normalizeWalletAddress(walletAddress);
+      return next();
+    } catch (err) {
+      sendApiError(req, res, {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+        message: err instanceof Error ? err.message : 'Invalid wallet signature or nonce',
+      });
+      return;
+    }
+  }
+
+  sendApiError(req, res, {
+    status: 401,
+    code: 'AUTH_REQUIRED',
+    message: 'Strategy switch requires a signed wallet action or admin API key',
+  });
+}
+
+router.get('/strategy/cooldown', cacheMiddleware({ ttl: 5000 }), async (_req: Request, res: Response) => {
   const cooldownSec = parseInt(process.env.STRATEGY_SWITCH_COOLDOWN_SEC || '0', 10);
-  const lastSwitchIso = process.env.LAST_STRATEGY_SWITCH_TIME || null;
+  const lastSwitchIso = await getLastStrategySwitchTime();
   const now = Date.now();
   const lastSwitchMs = lastSwitchIso ? new Date(lastSwitchIso).getTime() : 0;
   const elapsed = lastSwitchMs > 0 ? Math.floor((now - lastSwitchMs) / 1000) : cooldownSec;
@@ -717,60 +876,73 @@ router.get('/strategy/cooldown', cacheMiddleware({ ttl: 5000 }), (_req: Request,
   });
 });
 
-router.post('/strategy', depositsLimiter, requireFlag('strategy-selection'), validate({ body: VaultStrategyBodySchema }), (req: Request, res: Response) => {
-  const cooldownSec = parseInt(process.env.STRATEGY_SWITCH_COOLDOWN_SEC || '0', 10);
-  const lastSwitchIso = process.env.LAST_STRATEGY_SWITCH_TIME || null;
-  const now = Date.now();
-  const lastSwitchMs = lastSwitchIso ? new Date(lastSwitchIso).getTime() : 0;
+router.post(
+  '/strategy',
+  depositsLimiter,
+  requireFlag('strategy-selection'),
+  requireStrategyAuth,
+  validate({ body: VaultStrategyBodySchema }),
+  async (req: Request, res: Response) => {
+    const cooldownSec = parseInt(process.env.STRATEGY_SWITCH_COOLDOWN_SEC || '0', 10);
+    const lastSwitchIso = await getLastStrategySwitchTime();
+    const now = Date.now();
+    const lastSwitchMs = lastSwitchIso ? new Date(lastSwitchIso).getTime() : 0;
 
-  if (cooldownSec > 0 && lastSwitchMs > 0) {
-    const elapsed = Math.floor((now - lastSwitchMs) / 1000);
-    if (elapsed < cooldownSec) {
-      const retryAfter = cooldownSec - elapsed;
-      res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({
-        error: 'Too Many Requests',
-        status: 429,
-        code: 'STRATEGY_COOLDOWN_ACTIVE',
-        message: `Strategy switch cooldown active. Retry in ${retryAfter}s.`,
-        cooldownRemaining: retryAfter,
-        cooldownTotal: cooldownSec,
-      });
+    if (cooldownSec > 0 && lastSwitchMs > 0) {
+      const elapsed = Math.floor((now - lastSwitchMs) / 1000);
+      if (elapsed < cooldownSec) {
+        const retryAfter = cooldownSec - elapsed;
+        res.setHeader('Retry-After', String(retryAfter));
+        sendApiError(req, res, {
+          status: 429,
+          code: 'STRATEGY_COOLDOWN_ACTIVE',
+          message: `Strategy switch cooldown active. Retry in ${retryAfter}s.`,
+          details: {
+            cooldownRemaining: retryAfter,
+            cooldownTotal: cooldownSec,
+          },
+        });
+        return;
+      }
     }
+
+    const strategyId = typeof req.body?.strategyId === 'string' ? req.body.strategyId : 'default';
+    const previousStrategyId =
+      typeof req.body?.previousStrategyId === 'string' ? req.body.previousStrategyId : undefined;
+
+    const actingWallet = String(req.body?.walletAddress ?? req.get('x-wallet-address') ?? 'admin');
+
+    await recordStrategySwitchTime(actingWallet, strategyId, previousStrategyId);
+    process.env.LAST_STRATEGY_SWITCH_TIME = new Date().toISOString();
+
+    void eventOutboxService
+      .writeEvent({
+        eventType: 'vault.strategy.changed',
+        payload: {
+          transactionId: `strategy-${crypto.randomBytes(4).toString('hex')}`,
+          amount: '0',
+          asset: 'RWA',
+          walletAddress: actingWallet,
+          transactionHash: 'strategy-change',
+          status: 'accepted',
+          timestamp: new Date().toISOString(),
+          vaultId: 'primary',
+          strategyId,
+          previousStrategyId,
+        },
+        aggregateType: 'vault',
+        aggregateId: 'primary',
+      })
+      .catch((error) => {
+        logger.log('error', 'Failed to write strategy change webhook event', {
+          error: error instanceof Error ? error.message : String(error),
+          strategyId,
+        });
+      });
+
+    return res.status(200).json({ message: 'Strategy selection endpoint (v2 preview)' });
   }
-
-  const strategyId = typeof req.body?.strategyId === 'string' ? req.body.strategyId : 'default';
-  const previousStrategyId =
-    typeof req.body?.previousStrategyId === 'string' ? req.body.previousStrategyId : undefined;
-
-  // Record switch time for cooldown tracking
-  process.env.LAST_STRATEGY_SWITCH_TIME = new Date().toISOString();
-
-  void eventOutboxService.writeEvent({
-    eventType: 'vault.strategy.changed',
-    payload: {
-      transactionId: `strategy-${crypto.randomBytes(4).toString('hex')}`,
-      amount: '0',
-      asset: 'RWA',
-      walletAddress: String(req.body?.walletAddress ?? req.get('x-wallet-address') ?? 'unknown'),
-      transactionHash: 'strategy-change',
-      status: 'accepted',
-      timestamp: new Date().toISOString(),
-      vaultId: 'primary',
-      strategyId,
-      previousStrategyId,
-    },
-    aggregateType: 'vault',
-    aggregateId: 'primary',
-  }).catch((error) => {
-    logger.log('error', 'Failed to write strategy change webhook event', {
-      error: error instanceof Error ? error.message : String(error),
-      strategyId,
-    });
-  });
-
-  res.status(200).json({ message: 'Strategy selection endpoint (v2 preview)' });
-});
+);
 
 /**
  * POST /api/v1/vault/gasless-deposits
@@ -795,21 +967,22 @@ router.post(
     const relayerAddress = req.get('x-relayer-address') || req.get('x-wallet-address');
 
     if (!relayerAddress) {
-      return res.status(400).json({
-        error: 'Bad Request',
+      sendApiError(req, res, {
         status: 400,
+        code: 'RELAYER_ADDRESS_REQUIRED',
         message: 'Relayer address is required (x-relayer-address header)',
       });
+      return;
     }
 
     const walletLock = tryAcquireWalletLock(normalizedWallet);
     if (!walletLock.acquired) {
-      return res.status(409).json({
-        error: 'Conflict',
+      sendApiError(req, res, {
         status: 409,
         code: 'WALLET_OPERATION_IN_PROGRESS',
         message: 'Another operation is already in progress for this wallet',
       });
+      return;
     }
 
     try {
@@ -879,28 +1052,38 @@ router.post(
         errorMessage: err instanceof Error ? err.message : String(err),
       });
 
-      return res.status(500).json({
-        error: 'Internal Server Error',
+      sendApiError(req, res, {
         status: 500,
+        code: 'GASLESS_DEPOSIT_ERROR',
         message: 'Failed to process gasless deposit',
       });
+      return;
     } finally {
       walletLock.release();
     }
-  },
+  }
 );
 
 router.get('/receipts', readsLimiter, async (req: Request, res: Response) => {
   const prisma = getPrismaClient();
   const wallet = req.query.wallet as string | undefined;
-  const limit = Math.min(parseInt(req.query.limit as string || '50', 10), 100);
+  // Clamp rather than parseInt: `limit=abc` used to become NaN and `limit=-5`
+  // stayed negative, both of which reach Prisma as `take` and 500 the request
+  // instead of serving a valid page (#1318).
+  const limit = clampLimitNumber(
+    req.query.limit === undefined ? undefined : parseInt(req.query.limit as string, 10),
+    RECEIPTS_PAGINATION_CONFIG
+  );
   const cursor = req.query.cursor as string | undefined;
 
   const where = wallet ? { user: wallet } : {};
 
   const transactions = await prisma.transaction.findMany({
     where,
-    orderBy: { createdAt: 'desc' },
+    // `Transaction` records their time in `timestamp`; ordering by `createdAt`
+    // made every call fail Prisma's validation, so this endpoint could only
+    // ever answer 500.
+    orderBy: { timestamp: 'desc' },
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
@@ -916,7 +1099,7 @@ router.get('/receipts', readsLimiter, async (req: Request, res: Response) => {
     status: tx.status,
     walletAddress: tx.user,
     explorerUrl: `${EXPLORER_BASE_URL}/${tx.id}`,
-    timestamp: tx.createdAt.toISOString(),
+    timestamp: tx.timestamp.toISOString(),
   }));
 
   res.status(200).json({

@@ -43,7 +43,9 @@ fn mint(env: &Env, token_addr: &Address, _admin: &Address, recipient: &Address, 
 
 // ── pure math helpers (delegates to centralized math module) ──────────────────
 
-use crate::math::{try_assets_to_shares as shares_for, try_shares_to_assets as assets_for};
+use crate::math::{
+    try_assets_to_shares as shares_for, try_shares_to_assets as assets_for, MathError,
+};
 
 // ── property strategies ───────────────────────────────────────────────────────
 
@@ -67,11 +69,14 @@ proptest! {
         total_shares in pos_i128(),
         total_assets in pos_i128(),
     ) {
-        // The function returns None on overflow – assert it always returns Some
-        // for the range where the intermediate product fits in i128.
+        // The function returns an error on overflow.
         // For inputs where overflow would occur, checked_mul returns None which
         // is the correct safe behaviour; we just verify no panic occurs.
-        let _ = shares_for(assets, total_shares, total_assets);
+        let expected = assets
+            .checked_mul(total_shares)
+            .and_then(|product| product.checked_div(total_assets))
+            .ok_or(MathError::Overflow);
+        prop_assert_eq!(shares_for(assets, total_shares, total_assets), expected);
     }
 
     /// `assets_for` must never overflow for any positive inputs.
@@ -81,7 +86,11 @@ proptest! {
         total_shares in pos_i128(),
         total_assets in pos_i128(),
     ) {
-        let _ = assets_for(shares, total_shares, total_assets);
+        let expected = shares
+            .checked_mul(total_assets)
+            .and_then(|product| product.checked_div(total_shares))
+            .ok_or(MathError::Overflow);
+        prop_assert_eq!(assets_for(shares, total_shares, total_assets), expected);
     }
 
     /// Round-trip: assets_for(shares_for(a)) <= a  (no value extraction).
@@ -90,8 +99,8 @@ proptest! {
         assets in 1i128..=1_000_000_000_000i128,
         (total_shares, total_assets) in vault_state(),
     ) {
-        if let Some(shares) = shares_for(assets, total_shares, total_assets) {
-            if let Some(returned) = assets_for(shares, total_shares + shares, total_assets + assets) {
+        if let Ok(shares) = shares_for(assets, total_shares, total_assets) {
+            if let Ok(returned) = assets_for(shares, total_shares + shares, total_assets + assets) {
                 // Due to integer division, returned <= assets always.
                 prop_assert!(
                     returned <= assets,
@@ -112,7 +121,7 @@ proptest! {
     ) {
         let sa = shares_for(a, total_shares, total_assets);
         let sb = shares_for(b, total_shares, total_assets);
-        if let (Some(sa), Some(sb)) = (sa, sb) {
+        if let (Ok(sa), Ok(sb)) = (sa, sb) {
             if a < b {
                 prop_assert!(sa <= sb, "shares not monotone: shares({})={} > shares({})={}", a, sa, b, sb);
             }
@@ -128,7 +137,7 @@ proptest! {
     ) {
         let a1 = assets_for(s1, total_shares, total_assets);
         let a2 = assets_for(s2, total_shares, total_assets);
-        if let (Some(a1), Some(a2)) = (a1, a2) {
+        if let (Ok(a1), Ok(a2)) = (a1, a2) {
             if s1 < s2 {
                 prop_assert!(a1 <= a2, "assets not monotone: assets({})={} > assets({})={}", s1, a1, s2, a2);
             }
@@ -152,7 +161,7 @@ proptest! {
     ) {
         let before = assets_for(shares, total_shares, total_assets);
         let after  = assets_for(shares, total_shares, total_assets + yield_amount);
-        if let (Some(before), Some(after)) = (before, after) {
+        if let (Ok(before), Ok(after)) = (before, after) {
             prop_assert!(
                 after >= before,
                 "yield accrual decreased redemption value: {} < {}",

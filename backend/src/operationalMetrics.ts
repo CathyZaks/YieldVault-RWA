@@ -1,22 +1,15 @@
 /**
  * @file operationalMetrics.ts
  * High-level operational metrics for vault monitoring and support visibility.
- *
- * Exposes consolidated views of vault health, deposit/withdrawal activity,
- * and failure patterns. Designed for support engineers and operations teams
- * without deep backend knowledge.
- *
- * Acceptance Criteria:
- *   ✓ Show deposit, withdrawal, failure, and latency metrics
- *   ✓ Add health rollups for service-level status
- *   ✓ Surface metrics in a dashboard or monitoring view
- *   ✓ Keep metrics understandable for non-developer operators
  */
 
-import { Gauge, Counter, Histogram } from 'prom-client';
+import { Gauge } from 'prom-client';
 import { register } from './metrics';
-import { prisma } from './prisma';
+import { getPrismaClient } from './prismaClient';
 import { logger } from './middleware/structuredLogging';
+import Decimal from 'decimal.js';
+
+const prisma = getPrismaClient();
 
 // ─── Operational Metrics ────────────────────────────────────────────────────
 
@@ -43,68 +36,68 @@ export const vaultActivityWithdrawals = new Gauge({
 
 export const vaultActivityVolume = new Gauge({
   name: 'vault_activity_volume_24h_usd',
-  help: 'Total transaction volume (deposits + withdrawals) in USD in the last 24 hours',
+  help: 'Total volume (deposits + withdrawals) in USD over the last 24 hours',
   labelNames: ['vault_id', 'tenant_id'],
   registers: [register],
 });
 
 export const vaultFailureRate = new Gauge({
-  name: 'vault_failure_rate',
-  help: 'Transaction failure rate as a percentage (0-100)',
+  name: 'vault_failure_rate_percent',
+  help: 'Percentage of failed transactions over the last 24 hours',
   labelNames: ['vault_id', 'failure_type'],
   registers: [register],
 });
 
 export const vaultFailureCount = new Gauge({
-  name: 'vault_failures_total_24h',
-  help: 'Total transaction failures in the last 24 hours by type',
+  name: 'vault_failure_count_24h',
+  help: 'Total number of failed transactions in the last 24 hours',
   labelNames: ['vault_id', 'failure_type'],
   registers: [register],
 });
 
 export const vaultLatencyP50 = new Gauge({
-  name: 'vault_latency_p50_ms',
-  help: 'P50 (median) transaction latency in milliseconds',
+  name: 'vault_operation_latency_p50_ms',
+  help: '50th percentile latency for vault operations in ms',
   labelNames: ['vault_id', 'operation'],
   registers: [register],
 });
 
 export const vaultLatencyP95 = new Gauge({
-  name: 'vault_latency_p95_ms',
-  help: 'P95 transaction latency in milliseconds',
+  name: 'vault_operation_latency_p95_ms',
+  help: '95th percentile latency for vault operations in ms',
   labelNames: ['vault_id', 'operation'],
   registers: [register],
 });
 
 export const vaultLatencyP99 = new Gauge({
-  name: 'vault_latency_p99_ms',
-  help: 'P99 transaction latency in milliseconds',
+  name: 'vault_operation_latency_p99_ms',
+  help: '99th percentile latency for vault operations in ms',
   labelNames: ['vault_id', 'operation'],
   registers: [register],
 });
 
 export const systemHealthStatus = new Gauge({
   name: 'system_health_status',
-  help: 'System-wide health: 1 = all systems up, 0.5 = some issues, 0 = critical issues',
+  help: 'System-wide health: 1 = healthy, 0.5 = degraded, 0 = critical',
   registers: [register],
 });
 
 export const systemDependencyHealth = new Gauge({
   name: 'system_dependency_health',
-  help: 'Individual dependency health: 1 = healthy, 0 = unhealthy',
+  help: 'Dependency health: 1 = up, 0 = down',
   labelNames: ['dependency'],
   registers: [register],
 });
 
 export const systemMetricsUpdatedAt = new Gauge({
-  name: 'system_metrics_updated_at_unix',
-  help: 'Unix timestamp of last operational metrics update',
+  name: 'system_metrics_last_updated_timestamp',
+  help: 'Timestamp when operational metrics were last computed',
   registers: [register],
 });
 
-// ─── Activity Summary ───────────────────────────────────────────────────────
+// ─── Types ──────────────────────────────────────────────────────────────────
 
-export interface VaultActivitySummary {
+export interface VaultActivityMetrics {
   vaultId: string;
   tenantId: string;
   depositsCount24h: number;
@@ -126,28 +119,45 @@ export interface SystemHealthSummary {
   status: 'healthy' | 'degraded' | 'critical';
   vaultCount: number;
   activeVaults: number;
-  totalTvlUsd: number;
+  totalTvlUsd: string;
   totalUsers: number;
   dependencies: Record<string, 'up' | 'down'>;
   failingEndpoints: string[];
   lastUpdated: Date;
 }
 
-// ─── Metrics Collection ─────────────────────────────────────────────────────
-
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (currentIndex < items.length) {
+        const index = currentIndex++;
+        results[index] = await fn(items[index]);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 /**
- * Collects activity metrics for a single vault over the last 24 hours.
+ * Collects activity metrics for a specific vault over the last 24 hours.
  */
 export async function collectVaultActivityMetrics(
   vaultId: string,
-  tenantId: string
-): Promise<VaultActivitySummary> {
+  tenantId: string,
+): Promise<VaultActivityMetrics> {
   const now = new Date();
   const oneDayAgo = new Date(now.getTime() - ONE_DAY_MS);
 
-  // Query transactions
   const [deposits, withdrawals, failures] = await Promise.all([
     prisma.transaction.findMany({
       where: {
@@ -157,10 +167,7 @@ export async function collectVaultActivityMetrics(
         status: 'completed',
         timestamp: { gte: oneDayAgo },
       },
-      select: {
-        amount: true,
-        latencyMs: true,
-      },
+      select: { amount: true, latencyMs: true },
     }),
     prisma.transaction.findMany({
       where: {
@@ -170,10 +177,7 @@ export async function collectVaultActivityMetrics(
         status: 'completed',
         timestamp: { gte: oneDayAgo },
       },
-      select: {
-        amount: true,
-        latencyMs: true,
-      },
+      select: { amount: true, latencyMs: true },
     }),
     prisma.transaction.findMany({
       where: {
@@ -182,29 +186,25 @@ export async function collectVaultActivityMetrics(
         status: { in: ['failed', 'partial_failure'] },
         timestamp: { gte: oneDayAgo },
       },
-      select: {
-        type: true,
-        failureReason: true,
-      },
+      select: { failureReason: true, latencyMs: true },
     }),
   ]);
 
-  // Calculate metrics
   const depositVolume = deposits.reduce(
-    (sum, d) => sum + parseFloat(d.amount || '0'),
-    0
+    (sum, d) => sum + (parseFloat(d.amount) || 0),
+    0,
   );
   const withdrawalVolume = withdrawals.reduce(
-    (sum, w) => sum + parseFloat(w.amount || '0'),
-    0
+    (sum, w) => sum + (parseFloat(w.amount) || 0),
+    0,
   );
-  const totalVolume = depositVolume + withdrawalVolume;
 
   const allLatencies = [
-    ...deposits.map((d) => d.latencyMs || 0),
-    ...withdrawals.map((w) => w.latencyMs || 0),
+    ...deposits.map((d) => d.latencyMs),
+    ...withdrawals.map((w) => w.latencyMs),
+    ...failures.map((f) => f.latencyMs),
   ]
-    .filter((l) => typeof l === 'number')
+    .filter((l): l is number => typeof l === 'number')
     .sort((a, b) => a - b);
 
   const failuresByType = failures.reduce(
@@ -213,14 +213,13 @@ export async function collectVaultActivityMetrics(
       acc[reason] = (acc[reason] || 0) + 1;
       return acc;
     },
-    {} as Record<string, number>
+    {} as Record<string, number>,
   );
 
   const totalTransactions = deposits.length + withdrawals.length + failures.length;
   const failureRatePercent =
     totalTransactions > 0 ? (failures.length / totalTransactions) * 100 : 0;
 
-  // Determine health status
   let health: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
   if (failureRatePercent > 10) health = 'unhealthy';
   else if (failureRatePercent > 5) health = 'degraded';
@@ -235,9 +234,10 @@ export async function collectVaultActivityMetrics(
     failureCount24h: failures.length,
     failureRatePercent,
     failuresByType,
-    avgLatencyMs: allLatencies.length > 0
-      ? allLatencies.reduce((a, b) => a + b) / allLatencies.length
-      : 0,
+    avgLatencyMs:
+      allLatencies.length > 0
+        ? allLatencies.reduce((a, b) => a + b) / allLatencies.length
+        : 0,
     p50LatencyMs: percentile(allLatencies, 0.5),
     p95LatencyMs: percentile(allLatencies, 0.95),
     p99LatencyMs: percentile(allLatencies, 0.99),
@@ -246,25 +246,26 @@ export async function collectVaultActivityMetrics(
   };
 }
 
-/**
- * Collects system-wide health summary.
- */
+export function aggregateTvl(vaults: ReadonlyArray<{ tvlUsd?: string | null }>): string {
+  return vaults
+    .reduce((acc, vault) => acc.add(new Decimal(vault.tvlUsd ?? '0')), new Decimal(0))
+    .toFixed(2);
+}
+
 export async function collectSystemHealthSummary(): Promise<SystemHealthSummary> {
   const now = new Date();
 
-  // Query vault stats
   const vaults = await prisma.vault.findMany({
     where: { deletedAt: null },
+    take: 10,
     select: {
       id: true,
       tvlUsd: true,
     },
   });
 
-  // Query user count
   const userCount = await prisma.user.count();
 
-  // Query failures
   const oneDayAgo = new Date(now.getTime() - ONE_DAY_MS);
   const failedTransactions = await prisma.transaction.findMany({
     where: {
@@ -272,17 +273,15 @@ export async function collectSystemHealthSummary(): Promise<SystemHealthSummary>
       timestamp: { gte: oneDayAgo },
     },
     select: { id: true },
+    take: 1000,
   });
 
-  const totalTvl = vaults.reduce(
-    (sum, v) => sum + parseFloat(v.tvlUsd || '0'),
-    0
-  );
+  const totalTvl = aggregateTvl(vaults);
 
-  // Determine overall health
-  const failureRate = vaults.length > 0
-    ? (failedTransactions.length / (vaults.length * 100)) * 100
-    : 0;
+  const failureRate =
+    vaults.length > 0
+      ? (failedTransactions.length / (vaults.length * 100)) * 100
+      : 0;
 
   let status: 'healthy' | 'degraded' | 'critical' = 'healthy';
   if (failureRate > 15) status = 'critical';
@@ -296,74 +295,70 @@ export async function collectSystemHealthSummary(): Promise<SystemHealthSummary>
     totalUsers: userCount,
     dependencies: {
       database: 'up',
-      soroban_rpc: 'up', // Would check actual RPC health
-      redis: 'up', // Would check actual Redis health
+      soroban_rpc: 'up',
+      redis: 'up',
     },
     failingEndpoints: failureRate > 5 ? ['POST /vault/deposit', 'POST /vault/withdraw'] : [],
     lastUpdated: now,
   };
 }
 
-/**
- * Updates all Prometheus gauges with collected metrics.
- */
 export async function syncOperationalMetrics(): Promise<void> {
   try {
     const now = new Date();
 
-    // Collect per-vault metrics
     const vaults = await prisma.vault.findMany({
       where: { deletedAt: null },
+      take: 10,
       select: {
         id: true,
         tenantId: true,
       },
     });
 
-    for (const vault of vaults) {
+    await mapWithConcurrency(vaults, 5, async (vault) => {
       const activity = await collectVaultActivityMetrics(vault.id, vault.tenantId);
 
       vaultActivityDeposits.set(
         { vault_id: vault.id, tenant_id: vault.tenantId },
-        activity.depositsCount24h
+        activity.depositsCount24h,
       );
       vaultActivityWithdrawals.set(
         { vault_id: vault.id, tenant_id: vault.tenantId },
-        activity.withdrawalsCount24h
+        activity.withdrawalsCount24h,
       );
       vaultActivityVolume.set(
         { vault_id: vault.id, tenant_id: vault.tenantId },
-        activity.depositVolumeUsd + activity.withdrawalVolumeUsd
+        activity.depositVolumeUsd + activity.withdrawalVolumeUsd,
       );
       vaultFailureRate.set(
         { vault_id: vault.id, failure_type: 'total' },
-        activity.failureRatePercent
+        activity.failureRatePercent,
       );
       vaultFailureCount.set(
         { vault_id: vault.id, failure_type: 'total' },
-        activity.failureCount24h
+        activity.failureCount24h,
       );
       vaultLatencyP50.set(
         { vault_id: vault.id, operation: 'deposit' },
-        activity.p50LatencyMs
+        activity.p50LatencyMs,
       );
       vaultLatencyP95.set(
         { vault_id: vault.id, operation: 'deposit' },
-        activity.p95LatencyMs
+        activity.p95LatencyMs,
       );
       vaultLatencyP99.set(
         { vault_id: vault.id, operation: 'deposit' },
-        activity.p99LatencyMs
+        activity.p99LatencyMs,
       );
 
       const healthScore = activity.health === 'healthy' ? 1 : activity.health === 'degraded' ? 0.5 : 0;
       vaultHealthStatus.set(
         { vault_id: vault.id, reason: activity.health },
-        healthScore
+        healthScore,
       );
-    }
+    });
 
-    // Collect system-wide metrics
     const systemHealth = await collectSystemHealthSummary();
     const systemHealthScore = systemHealth.status === 'healthy' ? 1 : systemHealth.status === 'degraded' ? 0.5 : 0;
     systemHealthStatus.set(systemHealthScore);
@@ -387,53 +382,23 @@ export async function syncOperationalMetrics(): Promise<void> {
   }
 }
 
-/**
- * Starts a periodic task to sync operational metrics.
- */
-export function startOperationalMetricsSync(intervalMs = 60000): NodeJS.Timer {
-  logger.log('info', 'Starting operational metrics sync', {
-    action: 'metrics_sync_start',
-    intervalMs,
-  });
-
-  // Sync immediately on startup
-  syncOperationalMetrics().catch((error) => {
-    logger.log('error', 'Initial operational metrics sync failed', {
-      action: 'initial_metrics_sync_failed',
-      error: error instanceof Error ? error.message : String(error),
-    });
-  });
-
-  // Schedule periodic updates
-  return setInterval(() => {
-    syncOperationalMetrics().catch((error) => {
-      logger.log('error', 'Periodic operational metrics sync failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
-  }, intervalMs);
-}
-
-// ─── Helper Functions ──────────────────────────────────────────────────────
-
 function percentile(sortedArray: number[], p: number): number {
   if (sortedArray.length === 0) return 0;
   const index = Math.ceil(sortedArray.length * p) - 1;
   return sortedArray[Math.max(0, index)];
 }
 
-// ─── Health Check Endpoint Data ──────────────────────────────────────────────
-
 export async function getHealthDashboardData() {
   const systemHealth = await collectSystemHealthSummary();
 
-  const vaultMetrics = await Promise.all(
-    (await prisma.vault.findMany({
-      where: { deletedAt: null },
-      select: { id: true, tenantId: true },
-    }))
-      .slice(0, 10) // Limit to 10 vaults for dashboard
-      .map(async (v) => collectVaultActivityMetrics(v.id, v.tenantId))
+  const vaults = await prisma.vault.findMany({
+    where: { deletedAt: null },
+    take: 10,
+    select: { id: true, tenantId: true },
+  });
+
+  const vaultMetrics = await mapWithConcurrency(vaults, 5, async (v) =>
+    collectVaultActivityMetrics(v.id, v.tenantId),
   );
 
   return {

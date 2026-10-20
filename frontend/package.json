@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -23,14 +26,14 @@
     "check-size": "bundlesize"
   },
   "dependencies": {
-    "@yieldvault/api-schemas": "file:../packages/api-schemas",
     "@sentry/react": "^10.45.0",
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^14.6.1",
+    "@tanstack/query-sync-storage-persister": "^5.95.2",
     "@tanstack/react-query": "^5.95.2",
     "@tanstack/react-query-persist-client": "^5.95.2",
-    "@tanstack/query-sync-storage-persister": "^5.95.2",
     "@tanstack/react-virtual": "^3.14.3",
+    "@yieldvault/api-schemas": "file:../packages/api-schemas",
     "canvas-confetti": "^1.9.4",
     "es-toolkit": "^1.33.0",
     "framer-motion": "^12.23.12",
@@ -63,6 +66,8 @@
     "bundlesize2": "^0.0.35",
     "cypress": "^13.6.0",
     "eslint": "^9.39.1",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "fast-check": "^3.22.0",
@@ -80,7 +85,32 @@
   "bundlesize": [
     {
       "path": "./dist/assets/index-*.js",
-      "maxSize": "450 kB",
+      "maxSize": "150 kB",
+      "compression": "gzip"
+    },
+    {
+      "path": "./dist/assets/vendor-charts-*.js",
+      "maxSize": "200 kB",
+      "compression": "gzip"
+    },
+    {
+      "path": "./dist/assets/vendor-motion-*.js",
+      "maxSize": "100 kB",
+      "compression": "gzip"
+    },
+    {
+      "path": "./dist/assets/vendor-stellar-*.js",
+      "maxSize": "300 kB",
+      "compression": "gzip"
+    },
+    {
+      "path": "./dist/assets/vendor-sentry-*.js",
+      "maxSize": "150 kB",
+      "compression": "gzip"
+    },
+    {
+      "path": "./dist/assets/vendor-react-*.js",
+      "maxSize": "60 kB",
       "compression": "gzip"
     },
     {

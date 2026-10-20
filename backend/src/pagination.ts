@@ -1,3 +1,4 @@
+
 /**
  * @file pagination.ts
  * Pagination utilities and types for consistent list endpoint behavior.
@@ -11,6 +12,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import type { ParsedUtcDateRange } from './dateRange';
+import { logger } from './middleware/structuredLogging';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -46,6 +48,8 @@ export interface PaginationMeta {
   prevCursor: string | null;
   /** Current page number (for offset-based pagination). */
   currentPage: number | null;
+  /** Legacy alias for currentPage. */
+  page?: number;
   /** Total number of pages (if total is known). */
   totalPages: number | null;
   /** Whether there are more items after this page. */
@@ -76,10 +80,18 @@ export interface PaginationConfig {
   defaultLimit: number;
   /** Maximum allowed items per page. */
   maxLimit: number;
+  /**
+   * Highest page number a caller may request (Issue #1430). The effective
+   * offset handed to the database is `(page - 1) * limit`, so an unbounded
+   * page number turns into an unbounded `skip` scan.
+   */
+  maxPage: number;
   /** Whether to include total count in response. */
   includeTotal: boolean;
   /** Default sort field. */
   defaultSortBy?: string;
+  /** Allowed sort fields for the resource. */
+  allowedSortBy?: readonly string[];
   /** Default sort order. */
   defaultSortOrder: 'asc' | 'desc';
 }
@@ -89,11 +101,90 @@ export interface PaginationConfig {
 export const DEFAULT_PAGINATION_CONFIG: PaginationConfig = {
   defaultLimit: 20,
   maxLimit: 100,
+  maxPage: 1000,
   includeTotal: true,
   defaultSortOrder: 'desc',
 };
 
+export const CURSOR_SEPARATOR = '_';
+
+export class PaginationSortError extends Error {
+  constructor(requestedSortBy: string, allowedSortBy: readonly string[]) {
+    super(`Invalid sortBy value '${requestedSortBy}'. Allowed values: ${allowedSortBy.join(', ')}`);
+    this.name = 'PaginationSortError';
+  }
+}
+
+export function validateSortBy(
+  sortBy: string | undefined,
+  config: Partial<PaginationConfig> = {},
+): string | undefined {
+  const mergedConfig = { ...DEFAULT_PAGINATION_CONFIG, ...config };
+  const selectedSortBy = sortBy ?? mergedConfig.defaultSortBy;
+
+  if (!selectedSortBy || !mergedConfig.allowedSortBy || mergedConfig.allowedSortBy.length === 0) {
+    return selectedSortBy;
+  }
+
+  if (mergedConfig.allowedSortBy.includes(selectedSortBy)) {
+    return selectedSortBy;
+  }
+
+  logger.log('warn', 'Rejected invalid pagination sort field', {
+    requestedSortBy: selectedSortBy,
+    allowedSortBy: mergedConfig.allowedSortBy,
+  });
+
+  throw new PaginationSortError(selectedSortBy, mergedConfig.allowedSortBy);
+}
+
 // ─── Query Parsing ──────────────────────────────────────────────────────────
+
+/**
+ * Clamp a parsed 1-based page number to a usable value.
+ *
+ * Non-numeric, non-finite and non-positive values all become 1 so that
+ * out-of-range `page` params resolve to the first page instead of producing a
+ * negative offset or a negative `currentPage` in the response envelope.
+ *
+ * This is the single definition of page clamping: `parsePaginationQuery` and the
+ * list-response builders both route through it so the request parser and the
+ * response metadata can never disagree about what a given `page` means.
+ */
+export function clampPageNumber(page: number | undefined): number | undefined {
+  if (page === undefined) {
+    return undefined;
+  }
+  return Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
+}
+
+/**
+ * Clamp a requested page size into the endpoint's usable range.
+ *
+ * Undefined, non-numeric, non-finite and non-positive values all fall back to
+ * the endpoint default; anything above `maxLimit` is capped at `maxLimit`. This
+ * never rejects — a `limit` the caller could not use becomes a valid page size
+ * instead of a 400, which is what the contract tests require of every list
+ * endpoint.
+ *
+ * Like `clampPageNumber`, this is the single definition of limit clamping:
+ * `parsePaginationQuery` and the list-response builders both route through it,
+ * so a hand-rolled `parseInt(req.query.limit)` in a route handler can no longer
+ * leak a `NaN`, zero or oversized `limit` into a pagination envelope.
+ */
+export function clampLimitNumber(
+  limit: number | undefined,
+  config: Partial<PaginationConfig> = {}
+): number {
+  const mergedConfig = { ...DEFAULT_PAGINATION_CONFIG, ...config };
+
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return mergedConfig.defaultLimit;
+  }
+
+  const floored = Math.floor(limit);
+  return floored > 0 ? Math.min(floored, mergedConfig.maxLimit) : mergedConfig.defaultLimit;
+}
 
 /**
  * Parse and validate pagination query parameters from request.
@@ -109,25 +200,24 @@ export function parsePaginationQuery(
   const mergedConfig = { ...DEFAULT_PAGINATION_CONFIG, ...config };
   const query: PaginationQuery = {};
 
-  // Parse limit
+  // Parse limit (clamped — never rejected)
   if (req.query.limit !== undefined) {
-    const limit = parseInt(req.query.limit as string, 10);
-    if (!isNaN(limit) && limit > 0) {
-      query.limit = Math.min(limit, mergedConfig.maxLimit);
-    }
+    query.limit = clampLimitNumber(parseInt(req.query.limit as string, 10), mergedConfig);
   }
-  query.limit = query.limit || mergedConfig.defaultLimit;
+  query.limit = query.limit ?? mergedConfig.defaultLimit;
 
   // Parse cursor (opaque string, no validation needed)
   if (req.query.cursor !== undefined && typeof req.query.cursor === 'string') {
     query.cursor = req.query.cursor;
   }
 
-  // Parse page (1-based)
+  // Parse page (1-based, clamped to 1..maxPage — never rejected, Issue #1430)
   if (req.query.page !== undefined) {
-    const page = parseInt(req.query.page as string, 10);
-    if (!isNaN(page) && page > 0) {
-      query.page = page;
+    const page = clampPageNumber(parseInt(req.query.page as string, 10)) ?? 1;
+    query.page = Math.min(page, mergedConfig.maxPage);
+    const parsedPage = parseInt(req.query.page as string, 10);
+    if (!Number.isNaN(parsedPage) && parsedPage > 0) {
+      query.page = Math.min(parsedPage, mergedConfig.maxPage);
     } else {
       query.page = 1;
     }
@@ -135,9 +225,9 @@ export function parsePaginationQuery(
 
   // Parse sortBy
   if (req.query.sortBy !== undefined && typeof req.query.sortBy === 'string') {
-    query.sortBy = req.query.sortBy;
+    query.sortBy = validateSortBy(req.query.sortBy, mergedConfig);
   } else if (mergedConfig.defaultSortBy) {
-    query.sortBy = mergedConfig.defaultSortBy;
+    query.sortBy = validateSortBy(mergedConfig.defaultSortBy, mergedConfig);
   }
 
   // Parse sortOrder
@@ -167,12 +257,13 @@ export function paginateWithCursor<T>(
   query: PaginationQuery,
   getCursor: (item: T) => string
 ): { data: T[]; pagination: PaginationMeta } {
-  const limit = query.limit || DEFAULT_PAGINATION_CONFIG.defaultLimit;
+  const limit = clampLimitNumber(query.limit);
+  const page = clampPageNumber(query.page);
   let startIndex = 0;
   const invalidCursor = false;
 
-  if (query.page && query.page > 0) {
-    startIndex = (query.page - 1) * limit;
+  if (page && page > 1) {
+    startIndex = (page - 1) * limit;
   }
 
   // Find starting position based on cursor
@@ -184,11 +275,11 @@ export function paginateWithCursor<T>(
         pagination: createPaginationEnvelope({
           count: 0,
           limit,
-          total: query.page ? items.length : null,
+          total: page ? items.length : null,
           hasNextPage: false,
           hasPrevPage: false,
-          currentPage: query.page ? Math.max(1, query.page) : null,
-          totalPages: query.page ? Math.max(1, Math.ceil(items.length / limit)) : null,
+          currentPage: page ?? null,
+          totalPages: page ? Math.max(1, Math.ceil(items.length / limit)) : null,
         }),
       };
     }
@@ -221,8 +312,8 @@ export function paginateWithCursor<T>(
     total: items.length,
     hasNextPage: hasMore,
     hasPrevPage: startIndex > 0,
-    currentPage: query.page || null,
-    totalPages: query.page ? Math.max(1, Math.ceil(items.length / limit)) : null,
+    currentPage: page ?? null,
+    totalPages: page ? Math.max(1, Math.ceil(items.length / limit)) : null,
   });
 
   if (hasMore && data.length > 0) {
@@ -251,8 +342,8 @@ export function paginateWithOffset<T>(
   items: T[],
   query: PaginationQuery
 ): { data: T[]; pagination: PaginationMeta } {
-  const limit = query.limit || DEFAULT_PAGINATION_CONFIG.defaultLimit;
-  const page = query.page || 1;
+  const limit = clampLimitNumber(query.limit);
+  const page = clampPageNumber(query.page) ?? 1;
   const startIndex = (page - 1) * limit;
   const endIndex = startIndex + limit;
 
@@ -364,6 +455,7 @@ export function createPaginationEnvelope(meta: {
     nextCursor: meta.nextCursor ?? null,
     prevCursor: meta.prevCursor ?? null,
     currentPage: meta.currentPage ?? null,
+    page: meta.currentPage ?? undefined,
     totalPages: meta.totalPages ?? null,
     hasNextPage: meta.hasNextPage,
     hasPrevPage: meta.hasPrevPage,
@@ -425,4 +517,112 @@ export function encodeCursor(value: string): string {
  */
 export function decodeCursor(cursor: string): string {
   return Buffer.from(cursor, 'base64url').toString('utf-8');
+}
+
+// ─── Composite Cursor Helpers ───────────────────────────────────────────────
+
+/**
+ * Build a composite cursor from a timestamp and id.
+ *
+ * Format: `<timestamp>_<id>` (timestamp is ISO-8601; id is the row id).
+ * This matches the `?cursor=<timestamp>_<id>` contract used by list endpoints
+ * that need stable keyset pagination across inserts.
+ *
+ * @param timestamp - Sort timestamp (Date or ISO string)
+ * @param id - Row identifier
+ * @returns Composite cursor string
+ */
+export function buildCursor(timestamp: Date | string, id: string | number): string {
+  const ts = timestamp instanceof Date ? timestamp.toISOString() : timestamp;
+  return `${ts}${CURSOR_SEPARATOR}${id}`;
+}
+
+/**
+ * Parse a composite cursor of the form `<timestamp>_<id>`.
+ *
+ * Returns `null` when the cursor is malformed so callers can fall back to
+ * offset pagination or return an empty page.
+ *
+ * @param cursor - Composite cursor string
+ * @returns Parsed `{ timestamp, id }` or null when invalid
+ */
+export function parseCursor(
+  cursor: string
+): { timestamp: Date; id: string } | null {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    return null;
+  }
+
+  const separatorIndex = cursor.lastIndexOf(CURSOR_SEPARATOR);
+  if (separatorIndex <= 0 || separatorIndex === cursor.length - 1) {
+    return null;
+  }
+
+  const rawTimestamp = cursor.slice(0, separatorIndex);
+  const rawId = cursor.slice(separatorIndex + 1);
+  const timestamp = new Date(rawTimestamp);
+
+  if (Number.isNaN(timestamp.getTime()) || rawId.length === 0) {
+    return null;
+  }
+
+  return { timestamp, id: rawId };
+}
+
+/**
+ * Build the Prisma `where` clause for keyset pagination on `(timestamp, id)`.
+ *
+ * Rows strictly "after" the cursor in descending `(timestamp, id)` order are
+ * those with an older timestamp, or the same timestamp and a smaller id.
+ *
+ * @param cursor - Composite cursor string
+ * @returns Prisma where fragment, or `{}` when the cursor is invalid/absent
+ */
+export function buildCursorWhere(
+  cursor: string | undefined
+): Record<string, unknown> {
+  if (!cursor) {
+    return {};
+  }
+
+  const parsed = parseCursor(cursor);
+  if (!parsed) {
+    return {};
+  }
+
+  return {
+    OR: [
+      { timestamp: { lt: parsed.timestamp } },
+      { timestamp: parsed.timestamp, id: { lt: parsed.id } },
+    ],
+  };
+}
+
+/**
+ * Build the Prisma `orderBy` clause for stable keyset pagination.
+ *
+ * Uses `(timestamp desc, id desc)` so that the cursor tuple is unique even
+ * when multiple rows share the same timestamp.
+ *
+ * @returns Prisma orderBy array
+ */
+export function buildCursorOrderBy(): Array<Record<string, 'desc'>> {
+  return [{ timestamp: 'desc' }, { id: 'desc' }];
+}
+
+/**
+ * Extract the `nextCursor` value from the last item of a page.
+ *
+ * @param items - Page items (already ordered by `(timestamp desc, id desc)`)
+ * @param hasMore - Whether additional rows exist beyond this page
+ * @returns Composite cursor string or null
+ */
+export function nextCursorFromItems<
+  T extends { timestamp: Date | string; id: string | number }
+>(items: T[], hasMore: boolean): string | null {
+  if (!hasMore || items.length === 0) {
+    return null;
+  }
+  const last = items[items.length - 1];
+  return buildCursor(last.timestamp, last.id);
 }

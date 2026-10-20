@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm@9.12.0",
   "engines": {
-    "node": ">=20",
+    "node": ">=22",
     "pnpm": ">=9.12"
   },
   "name": "yieldvault-rwa",
@@ -20,12 +20,14 @@
   "scripts": {
     "check:pnpm-version": "node scripts/check-pnpm-version.js",
     "prepare": "husky",
-    "test": "vitest run",
     "lint:staged": "lint-staged",
     "commitlint": "commitlint",
+    "build:schemas": "npm --prefix packages/api-schemas run build",
+    "build": "pnpm build:schemas && pnpm --filter backend build && pnpm --filter frontend build",
+    "typecheck": "pnpm build:schemas && pnpm --filter backend typecheck && pnpm --filter frontend build",
     "dev": "concurrently \"pnpm:dev:backend\" \"pnpm:dev:frontend\"",
-    "dev:backend": "bash scripts/wait-for-db.sh && pnpm --filter backend dev",
-    "dev:frontend": "pnpm --filter frontend dev",
+    "dev:backend": "pnpm build:schemas && bash scripts/wait-for-db.sh && pnpm --filter backend dev",
+    "dev:frontend": "pnpm build:schemas && pnpm --filter frontend dev",
     "wait-for-db": "bash scripts/wait-for-db.sh",
     "test": "pnpm --filter backend test -- --runInBand --coverage && pnpm --filter frontend test --run",
     "test:backend": "pnpm --filter backend test -- --runInBand --coverage",
@@ -42,6 +44,8 @@
     "compress:images": "bash scripts/compress-pngs.sh",
     "validate:images": "tsx scripts/validate-image-sizes.ts",
     "test:validate-images": "vitest run scripts/validate-image-sizes.test.ts",
+    "validate:line-endings": "tsx scripts/validate-generated-artifacts.ts",
+    "test:validate-line-endings": "vitest run scripts/validate-generated-artifacts.test.ts",
     "clean:git-history": "bash scripts/purge-git-large-blobs.sh",
     "validate:frontend-env": "tsx scripts/validate-frontend-env.ts",
     "test:validate-frontend-env": "vitest run --config scripts/vitest.config.ts",
@@ -73,9 +77,5 @@
   },
   "resolutions": {
     "lodash": "^4.17.21"
-  },
-  "lint-staged": {
-    "{frontend,backend}/**/*.{ts,tsx}": "node scripts/lint-staged-runners.js eslint",
-    "contracts/**/*.rs": "node scripts/lint-staged-runners.js rustfmt"
   }
 }

@@ -10,11 +10,15 @@
  *   ✓ Validate ownership or tenant scope on every sensitive action
  *   ✓ Return authorization errors with clear messaging
  *   ✓ Document expected access patterns for operators
+ *   ✓ Enforce per-tenant API key scopes and expiry (API_KEY_EXPIRED / SCOPE_INSUFFICIENT)
+ *   ✓ Support legacy global API_KEY fallback with deprecation logging
  */
 
 import type { Request, Response, NextFunction } from 'express';
 import { logger } from './structuredLogging';
 import { prisma } from '../prisma';
+import { formatWalletForLog } from '../walletUtils';
+import type { ApiKeyRole } from './apiKeyAuth';
 
 // ─── Extended Express Request Interface ──────────────────────────────────────
 
@@ -24,6 +28,11 @@ declare global {
       tenantId?: string;
       walletAddress?: string;
       tenantScopes?: Set<string>;
+      authApiKeyTenantId?: string;
+      authApiKeyScopes?: string[];
+      authApiKeyRole?: ApiKeyRole;
+      authApiKeyHash?: string;
+      authApiKeyLegacy?: boolean;
     }
   }
 }
@@ -50,6 +59,26 @@ export class MissingTenantContext extends Error {
   }
 }
 
+export class ApiKeyExpiredError extends Error {
+  constructor(public readonly tenantId: string) {
+    super(`API key for tenant ${tenantId} has expired`);
+    this.name = 'ApiKeyExpiredError';
+  }
+}
+
+export class ScopeInsufficientError extends Error {
+  constructor(
+    public readonly tenantId: string,
+    public readonly requiredScope: string,
+    public readonly grantedScopes: string[]
+  ) {
+    super(
+      `Tenant ${tenantId} lacks required scope ${requiredScope}; granted: ${grantedScopes.join(',')}`
+    );
+    this.name = 'ScopeInsufficientError';
+  }
+}
+
 // ─── Tenant Scope Definition ─────────────────────────────────────────────────
 
 export interface TenantScope {
@@ -66,6 +95,8 @@ export const TENANT_SCOPES = {
   DELETE_TENANT_DATA: 'delete:tenant_data',
   READ_AUDIT: 'read:audit',
 } as const;
+
+export type TenantScopeName = (typeof TENANT_SCOPES)[keyof typeof TENANT_SCOPES];
 
 // ─── Core Middleware ────────────────────────────────────────────────────────
 
@@ -120,6 +151,13 @@ export function validateTenantOwnership(
   resourceName: string
 ): (req: Request, res: Response, next: NextFunction) => void {
   return (req: Request, res: Response, next: NextFunction): void => {
+    // Enforce per-tenant API key scope/expiry before any boundary check.
+    // Throws ApiKeyExpiredError / ScopeInsufficientError which are mapped to
+    // 401 responses with WWW-Authenticate by protectTenantRoute.
+    if (req.authApiKeyTenantId) {
+      assertApiKeyUsable(req, resourceName);
+    }
+
     // Admin/super-admin bypass with logging for audit trail
     if (req.authApiKeyRole === 'admin' || req.authApiKeyRole === 'super-admin') {
       logger.log('info', 'Admin access with tenant bypass', {
@@ -142,7 +180,7 @@ export function validateTenantOwnership(
     if (req.tenantId !== requestedTenantId) {
       logger.log('warn', 'Tenant boundary violation detected', {
         action: 'tenant_boundary_violation',
-        actor: req.authApiKeyHash || req.walletAddress,
+        actor: req.authApiKeyHash || (req.walletAddress ? formatWalletForLog(req.walletAddress) : undefined),
         tenantId: req.tenantId,
         requestedTenantId,
         resource: resourceName,
@@ -186,6 +224,78 @@ export async function validateWalletInTenant(
   }
 
   return true;
+}
+
+/**
+ * Validates that the authenticated API key is not expired and that its
+ * scopes cover the required scope for the given resource.
+ *
+ * The required scope is derived from the resource name via a small mapping
+ * so callers do not need to pass it explicitly. Unknown resources default
+ * to READ_TENANT_DATA which is the least-privileged read scope.
+ */
+export function requiredScopeForResource(resourceName: string): TenantScopeName {
+  const normalized = resourceName.toLowerCase();
+  if (normalized.includes('audit')) return TENANT_SCOPES.READ_AUDIT;
+  if (normalized.startsWith('delete') || normalized.includes('delete')) {
+    return TENANT_SCOPES.DELETE_TENANT_DATA;
+  }
+  if (normalized.includes('deposit') || normalized.includes('withdraw')) {
+    return TENANT_SCOPES.WRITE_TENANT_DATA;
+  }
+  if (normalized.includes('write') || normalized.includes('create') || normalized.includes('update')) {
+    return TENANT_SCOPES.WRITE_TENANT_DATA;
+  }
+  return TENANT_SCOPES.READ_TENANT_DATA;
+}
+
+/**
+ * Asserts that the API key attached to the request is usable for the
+ * requested resource. Throws typed errors consumed by protectTenantRoute.
+ */
+export function assertApiKeyUsable(req: Request, resourceName: string): void {
+  const tenantId = req.authApiKeyTenantId;
+  if (!tenantId) return;
+
+  // Expiry check: apiKeyAuth middleware sets authApiKeyExpiresAt when the
+  // key record has an expiresAt column populated.
+  const expiresAt = (req as Request & { authApiKeyExpiresAt?: Date | string | null })
+    .authApiKeyExpiresAt;
+  if (expiresAt) {
+    const expiry = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
+    if (!Number.isNaN(expiry.getTime()) && expiry.getTime() <= Date.now()) {
+      logger.log('warn', 'API key expired', {
+        action: 'api_key_expired',
+        actor: req.authApiKeyHash,
+        tenantId,
+        resource: resourceName,
+        expiresAt: expiry.toISOString(),
+      });
+      throw new ApiKeyExpiredError(tenantId);
+    }
+  }
+
+  const requiredScope = requiredScopeForResource(resourceName);
+  const granted = req.authApiKeyScopes || [];
+
+  // Legacy fallback: keys minted from the deprecated global API_KEY env var
+  // have no scopes recorded. Treat them as having all tenant scopes so the
+  // fallback path keeps working while operators migrate.
+  if (granted.length === 0 && (req.authApiKeyLegacy || (req.authApiKeyRole as unknown) === 'legacy')) {
+    return;
+  }
+
+  if (!granted.includes(requiredScope)) {
+    logger.log('warn', 'API key scope insufficient', {
+      action: 'api_key_scope_insufficient',
+      actor: req.authApiKeyHash,
+      tenantId,
+      resource: resourceName,
+      requiredScope,
+      grantedScopes: granted,
+    });
+    throw new ScopeInsufficientError(tenantId, requiredScope, granted);
+  }
 }
 
 /**
@@ -288,6 +398,30 @@ export function protectTenantRoute(resourceName: string, paramName = 'tenantId')
           error: 'Unauthorized',
           message: 'Missing tenant context',
           code: 'MISSING_TENANT_CONTEXT',
+        });
+        return;
+      }
+
+      if (error instanceof ApiKeyExpiredError) {
+        res.setHeader('WWW-Authenticate', 'ApiKey realm="tenant", error="invalid_token", error_description="API key expired"');
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: 'API key has expired',
+          code: 'API_KEY_EXPIRED',
+        });
+        return;
+      }
+
+      if (error instanceof ScopeInsufficientError) {
+        res.setHeader(
+          'WWW-Authenticate',
+          `ApiKey realm="tenant", error="insufficient_scope", scope="${error.requiredScope}"`
+        );
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: `API key missing required scope: ${error.requiredScope}`,
+          code: 'SCOPE_INSUFFICIENT',
+          requiredScope: error.requiredScope,
         });
         return;
       }

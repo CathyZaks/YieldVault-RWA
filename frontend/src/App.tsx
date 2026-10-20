@@ -46,12 +46,12 @@ import {
   LazyTransactionHistory,
   LazyUIPreview,
   LazyVaultComparison,
+  LazyVaultHealth,
+  observeLcp,
   prefetchDashboardRoutes,
+  recordRouteNavigation,
 } from "./lib/routePrefetch";
-import NetworkWarningBanner from "./components/NetworkWarningBanner";
-import OfflineBanner from "./components/OfflineBanner";
-import HighLatencyBanner from "./components/HighLatencyBanner";
-import NetworkBanner from "./components/NetworkBanner";
+import NetworkBannerStack from "./components/NetworkBannerStack";
 import { useVault, VaultProvider } from "./context/VaultContext";
 import { usePageViewTracking } from "./hooks/useAnalytics";
 import { ProtectedRoute } from "./components/ProtectedRoute";
@@ -63,7 +63,6 @@ const SentryRoutes = Sentry.withSentryReactRouterV6Routing(Routes);
 const TransactionReceipt = lazy(() => import("./pages/TransactionReceipt"));
 const StrategyDetail = lazy(() => import("./pages/StrategyDetail"));
 const Admin = lazy(() => import("./pages/Admin"));
-const VaultHealthDashboard = lazy(() => import("./pages/VaultHealthDashboard"));
 const AuditLog = lazy(() => import("./pages/AuditLog"));
 
 // Removed simple fallback in favor of components/ErrorFallback
@@ -77,14 +76,22 @@ function AppContent() {
   const location = useLocation();
   const { sessionState, intendedPath, setSessionExpired, clearSessionExpired, renewSession } = useAuth();
   usePageViewTracking();
-  const { data: usdcBalance = 0 } = useUsdcBalance(walletAddress);
-  const { data: xlmBalance = 0 } = useXlmBalance(walletAddress);
+  const { data: usdcBalance, isError: usdcBalanceError } = useUsdcBalance(walletAddress);
+  const { data: xlmBalance, isError: xlmBalanceError } = useXlmBalance(walletAddress);
+  const balancesError = usdcBalanceError || xlmBalanceError;
   const { tvl } = useVault();
   const role = useMemo(() => resolveUserRole(walletAddress), [walletAddress]);
   useRestoreGuardedRoute(role);
 
   useEffect(() => {
-    if ((window as Window & { Cypress?: unknown }).Cypress) {
+    // Skip SW registration when running under Playwright (VITE_E2E=1) or when
+    // explicitly disabled via VITE_ENABLE_SW=0.  Both flags are baked at build
+    // time by Vite so there is no runtime window pollution needed.
+    const swDisabled =
+      import.meta.env.VITE_E2E === "1" ||
+      import.meta.env.VITE_ENABLE_SW === "0";
+
+    if (swDisabled) {
       return;
     }
 
@@ -106,6 +113,15 @@ function AppContent() {
 
     const timeoutId = globalThis.setTimeout(schedulePrefetch, 1500);
     return () => globalThis.clearTimeout(timeoutId);
+  }, [location.pathname]);
+
+  // Observe Largest Contentful Paint and record each navigation together with
+  // its prefetch status. Comparing warm vs cold samples is how the issue's LCP
+  // improvement is measured in the field.
+  useEffect(() => observeLcp(), []);
+
+  useEffect(() => {
+    recordRouteNavigation(location.pathname);
   }, [location.pathname]);
 
   const handleConnect = useCallback((address: string) => {
@@ -170,14 +186,15 @@ function AppContent() {
         <MotionProvider>
         <SkipLinks />
         <RouteAnnouncer />
-        <OfflineBanner lastKnownTvl={tvl} lastKnownBalance={usdcBalance} />
+        <NetworkBannerStack
+          walletAddress={walletAddress}
+          lastKnownTvl={tvl}
+          lastKnownBalance={usdcBalance ?? 0}
+        />
         <div className="app-container">
-          <NetworkWarningBanner walletAddress={walletAddress} />
-          <HighLatencyBanner />
-          <NetworkBanner />
           <Navbar
             walletAddress={walletAddress}
-            usdcBalance={usdcBalance}
+            usdcBalance={usdcBalanceError ? null : usdcBalance ?? 0}
             onConnect={handleConnect}
             onDisconnect={handleDisconnect}
             role={role}
@@ -192,8 +209,9 @@ function AppContent() {
                     <RouteErrorBoundary routeName="home">
                       <LazyHome
                         walletAddress={walletAddress}
-                        usdcBalance={usdcBalance}
-                        xlmBalance={xlmBalance}
+                        usdcBalance={usdcBalance ?? 0}
+                        xlmBalance={xlmBalance ?? 0}
+                        balancesError={balancesError}
                       />
                     </RouteErrorBoundary>
                   }
@@ -216,14 +234,6 @@ function AppContent() {
                     </RouteErrorBoundary>
                   }
                 />
-                <Route path="/transactions" element={<ErrorBoundary><LazyTransactionHistory walletAddress={walletAddress} /></ErrorBoundary>} />
-                <Route path="/compare" element={<ErrorBoundary><LazyVaultComparison /></ErrorBoundary>} />
-                <Route path="/strategies/:strategyId" element={<ErrorBoundary><StrategyDetail walletAddress={walletAddress} /></ErrorBoundary>} />
-                <Route path="/receipt/:txHash" element={<ErrorBoundary><TransactionReceipt /></ErrorBoundary>} />
-                <Route path="/settings" element={<ErrorBoundary><LazySettings /></ErrorBoundary>} />
-                <Route path="/vault-health" element={<ErrorBoundary><VaultHealthDashboard /></ErrorBoundary>} />
-                <Route path="/audit-log" element={<ErrorBoundary><AuditLog /></ErrorBoundary>} />
-                <Route path="/ui-kit" element={<ErrorBoundary><LazyUIPreview /></ErrorBoundary>} />
                 <Route
                   path="/admin"
                   element={
@@ -278,7 +288,7 @@ function AppContent() {
                   path="/vault-health"
                   element={
                     <RouteErrorBoundary routeName="vault-health">
-                      <VaultHealthDashboard />
+                      <LazyVaultHealth />
                     </RouteErrorBoundary>
                   }
                 />
@@ -299,16 +309,13 @@ function AppContent() {
                   }
                 />
                 <Route
-                  path="/admin"
+                  path="*"
                   element={
-                    <ProtectedRoute role={role} allow={["admin"]}>
-                      <RouteErrorBoundary routeName="admin">
-                        <Admin walletAddress={walletAddress} />
-                      </RouteErrorBoundary>
-                    </ProtectedRoute>
+                    <RouteErrorBoundary routeName="not-found">
+                      <Navigate to="/" replace />
+                    </RouteErrorBoundary>
                   }
                 />
-                <Route path="*" element={<ErrorBoundary><Navigate to="/" replace /></ErrorBoundary>} />
               </SentryRoutes>
             </Suspense>
             </PageTransition>

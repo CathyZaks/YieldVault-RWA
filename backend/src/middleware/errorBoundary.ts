@@ -100,7 +100,9 @@ interface TypedErrorResponse {
 
 // ─── Classifier ─────────────────────────────────────────────────────────────
 
-function classifyError(err: Error): TypedErrorResponse | null {
+function classifyError(err: unknown): TypedErrorResponse | null {
+  if (!err || typeof err !== 'object') return null;
+
   // Already a typed upstream error
   if (err instanceof UpstreamError) {
     return {
@@ -130,19 +132,22 @@ function classifyError(err: Error): TypedErrorResponse | null {
 
   // Soroban simulation / submission errors
   if (err instanceof SorobanSimulationError) {
-    const retryable = ['RESTORE_REQUIRED', 'RPC_ERROR'].includes(
-      (err as any).code ?? '',
-    );
+    const retryable = ['RESTORE_REQUIRED', 'RPC_ERROR'].includes(err.code);
     return {
       error: 'SorobanError',
-      status: (err as any).statusCode ?? 502,
-      code: (err as any).code ?? 'RPC_ERROR',
+      status: err.statusCode,
+      code: err.code,
       message: err.message,
       dependency: 'stellar_rpc',
       retryable,
       retryAfterSeconds: retryable ? 15 : null,
     };
   }
+
+  // Known Prisma request errors: map to client-safe responses. Never expose
+  // err.meta, the raw message, or SQL fragments.
+  const prismaKnown = classifyPrismaKnownRequestError(err);
+  if (prismaKnown) return prismaKnown;
 
   // Prisma / database errors (detect by error code patterns)
   if (isPrismaError(err)) {
@@ -157,8 +162,12 @@ function classifyError(err: Error): TypedErrorResponse | null {
     };
   }
 
+  const errMessage = 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+    ? (err as { message: string }).message
+    : '';
+
   // Prisma query timeout
-  if (err.message?.includes('Prisma query timed out')) {
+  if (errMessage.includes('Prisma query timed out')) {
     return {
       error: 'DatabaseError',
       status: 503,
@@ -184,7 +193,7 @@ function classifyError(err: Error): TypedErrorResponse | null {
   }
 
   // Wallet scope violation from walletQueryGuard
-  if (err.message === 'FORBIDDEN_TENANT_ACCESS' || err.message === 'WALLET_SCOPE_VIOLATION') {
+  if (errMessage === 'FORBIDDEN_TENANT_ACCESS' || errMessage === 'WALLET_SCOPE_VIOLATION') {
     return {
       error: 'Forbidden',
       status: 403,
@@ -197,24 +206,64 @@ function classifyError(err: Error): TypedErrorResponse | null {
   return null;
 }
 
-function isPrismaError(err: Error): boolean {
-  const name = err.constructor?.name ?? '';
+function classifyPrismaKnownRequestError(err: unknown): TypedErrorResponse | null {
+  if (!err || typeof err !== 'object') return null;
+  const name = (err as { constructor?: { name?: string } }).constructor?.name;
+  if (name !== 'PrismaClientKnownRequestError') return null;
+
+  switch ((err as { code?: unknown }).code) {
+    case 'P2002':
+      return {
+        error: 'ConflictError',
+        status: 409,
+        code: 'CONFLICT',
+        message: 'Resource already exists',
+        retryable: false,
+      };
+    case 'P2003':
+      return {
+        error: 'InvalidReferenceError',
+        status: 400,
+        code: 'INVALID_REFERENCE',
+        message: 'Referenced resource does not exist',
+        retryable: false,
+      };
+    case 'P2025':
+      return {
+        error: 'NotFoundError',
+        status: 404,
+        code: 'NOT_FOUND',
+        message: 'Resource not found',
+        retryable: false,
+      };
+    default:
+      return null;
+  }
+}
+
+function isPrismaError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { constructor?: { name?: string } }).constructor?.name ?? '';
   if (name.startsWith('Prisma')) return true;
-  if ('code' in err && typeof (err as any).code === 'string') {
-    const code: string = (err as any).code;
+  if ('code' in err && typeof (err as { code?: unknown }).code === 'string') {
+    const code = (err as { code: string }).code;
     // Prisma error codes start with P
     if (/^P\d{4}$/.test(code)) return true;
   }
   return false;
 }
 
-function isRedisError(err: Error): boolean {
-  const msg = err.message?.toLowerCase() ?? '';
+function isRedisError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const msg = 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+    ? (err as { message: string }).message.toLowerCase()
+    : '';
+  const name = (err as { constructor?: { name?: string } }).constructor?.name ?? '';
   return (
     msg.includes('redis') ||
-    msg.includes('econnrefused') && msg.includes('6379') ||
-    err.constructor?.name === 'ReplyError' ||
-    err.constructor?.name === 'AbortError'
+    (msg.includes('econnrefused') && msg.includes('6379')) ||
+    name === 'ReplyError' ||
+    name === 'AbortError'
   );
 }
 
@@ -227,7 +276,7 @@ function isRedisError(err: Error): boolean {
  * Mount BEFORE the catch-all error handler so it gets first crack at errors.
  */
 export const errorBoundaryMiddleware: ErrorRequestHandler = (
-  err: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+  err: unknown,
   req: Request,
   res: Response,
   next: NextFunction,
@@ -250,7 +299,7 @@ export const errorBoundaryMiddleware: ErrorRequestHandler = (
     retryable: classified.retryable,
     correlationId,
     traceId,
-    originalError: err.message,
+    originalError: err instanceof Error ? err.message : String(err),
   });
 
   const body: TypedErrorResponse = {

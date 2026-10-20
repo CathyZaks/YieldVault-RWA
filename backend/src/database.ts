@@ -7,7 +7,7 @@ import { recordQueryPerformance } from './queryBudgets';
  * This can be implemented by pg.Pool or a mock for testing.
  */
 export interface IDatabasePool {
-  query<T = any>(text: string, params?: any[]): Promise<{ rows: T[] }>;
+  query<T = any>(name: string, params?: any[]): Promise<{ rows: T[] }>;
   end(): Promise<void>;
   isHealthy(): Promise<boolean>;
 }
@@ -61,8 +61,13 @@ export class PostgresDatabasePool implements IDatabasePool {
  * the actual state of the test environment rather than a database no test
  * suite ever provisions.
  */
+export type NoopDatabaseMode = 'test-noop' | 'misconfigured';
+
 export class NoopDatabasePool implements IDatabasePool {
-  constructor(private readonly name: string) {}
+  constructor(
+    private readonly name: string,
+    private readonly mode: NoopDatabaseMode = 'test-noop',
+  ) {}
 
   async query<T = any>(_text: string, _params?: any[]): Promise<{ rows: T[] }> {
     return { rows: [] };
@@ -71,7 +76,11 @@ export class NoopDatabasePool implements IDatabasePool {
   async end(): Promise<void> {}
 
   async isHealthy(): Promise<boolean> {
-    return true;
+    return false;
+  }
+
+  getHealthState(): 'up' | 'degraded' | 'down' {
+    return this.mode === 'test-noop' ? 'degraded' : 'down';
   }
 }
 
@@ -80,23 +89,21 @@ export class NoopDatabasePool implements IDatabasePool {
  * and a read-only replica, with automatic failover to primary for reads.
  */
 export class DatabaseManager {
-  private primaryPool: IDatabasePool;
-  private replicaPool: IDatabasePool;
-  private poolsAreShared: boolean;
+  private readonly primaryPool: IDatabasePool;
+  private readonly replicaPool: IDatabasePool;
+  private readonly poolsAreShared: boolean;
 
   constructor(primaryPool?: IDatabasePool, replicaPool?: IDatabasePool) {
     if (primaryPool) {
       this.primaryPool = primaryPool;
       this.replicaPool = replicaPool || primaryPool;
     } else if (process.env.NODE_ENV === 'test' && !process.env.DATABASE_URL) {
-      // No test suite provisions a real Postgres instance, and unlike Prisma
-      // (which falls back to its own sqlite dev.db) this raw pool had no
-      // test-mode fallback at all — every query attempted a real connection
-      // to the hardcoded dev default below, which no test environment
-      // actually runs. That made /health and anything touching `db` fail
-      // for a reason entirely unrelated to what the test was exercising.
-      this.primaryPool = new NoopDatabasePool('primary');
-      this.replicaPool = this.primaryPool;
+      // This is an intentional test fallback: the app is booted without a real
+      // database, but the pool should still advertise a degraded status instead
+      // of falsely reporting itself as healthy.
+      const noopPool = new NoopDatabasePool('primary', 'test-noop');
+      this.primaryPool = noopPool;
+      this.replicaPool = noopPool;
     } else {
       const primaryUrl = requireDatabaseUrl();
       this.primaryPool = new PostgresDatabasePool(primaryUrl, 'primary');
@@ -151,8 +158,8 @@ export class DatabaseManager {
    * Forces a query to the primary database, bypassing any replica routing.
    * Useful for reads that require the latest committed data (e.g. after a write).
    */
-  async queryPrimary<T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> {
-    return await this.executeWithBudget(this.primaryPool, 'raw_primary', text, params);
+  async queryPrimary<T = any>(name: string, params?: any[]): Promise<{ rows: T[] }> {
+    return await this.executeWithBudget(this.primaryPool, 'raw_primary', name, params);
   }
 
   /**
@@ -227,9 +234,20 @@ export class DatabaseManager {
       this.replicaPool.isHealthy().catch(() => false),
     ]);
 
+    const primaryStatus = primaryHealthy
+      ? 'up'
+      : this.primaryPool instanceof NoopDatabasePool
+        ? this.primaryPool.getHealthState()
+        : 'down';
+    const replicaStatus = replicaHealthy
+      ? 'up'
+      : this.replicaPool instanceof NoopDatabasePool
+        ? this.replicaPool.getHealthState()
+        : 'down';
+
     return {
-      primary: primaryHealthy ? 'up' : 'down',
-      replica: replicaHealthy ? 'up' : 'down',
+      primary: primaryStatus,
+      replica: replicaStatus,
     };
   }
 
@@ -256,7 +274,7 @@ function requireDatabaseUrl(): string {
     throw new Error('DATABASE_URL is required in production');
   }
 
-  return 'postgres://postgres:postgres@localhost:5432/yieldvault';
+  return 'postgres://postgres:postgres@localhost:5432/yieldviault';
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {

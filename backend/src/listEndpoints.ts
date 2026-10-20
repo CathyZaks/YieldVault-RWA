@@ -13,6 +13,9 @@ import { Router, Request, Response } from 'express';
 import { Readable } from 'stream';
 import {
   parsePaginationQuery,
+  clampLimitNumber,
+  clampPageNumber,
+  validateSortBy,
   paginateWithCursor,
   paginateWithOffset,
   sortItems,
@@ -38,7 +41,9 @@ import {
 import { tenantGuard } from './middleware/tenantGuard';
 import { createTimeoutFor } from './middleware/timeoutMiddleware';
 import { validate, PaginationQuerySchema, TransactionListQuerySchema } from './middleware/validate';
+import { logger } from './middleware/structuredLogging';
 import { getPrismaClient } from './prismaClient';
+import { sendApiError } from './middleware/apiError';
 
 const router = Router();
 const CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
@@ -163,18 +168,6 @@ export interface TransactionExportArtifact {
 // a real, checksum-valid Ed25519 public key (not just regex-shaped) since
 // some endpoints validate wallet addresses via StrKey.isValidEd25519PublicKey.
 const MOCK_WALLET_ADDRESS = 'GBF2VOZSQLF2BZRW6NIDETV2L3I6GHXZUEFSIESELEAGATV2FYTOHOHI';
-
-const MOCK_TRANSACTIONS: Transaction[] = Array.from({ length: 100 }, (_, i) => ({
-  id: `tx-${i + 1}`,
-  type: i % 2 === 0 ? 'deposit' : 'withdrawal',
-  status: i % 11 === 0 ? 'failed' : i % 3 === 0 ? 'pending' : 'completed',
-  amount: (Math.random() * 1000).toFixed(2),
-  asset: ['XLM', 'USDC', 'yUSDC', 'RWA'][i % 4],
-  timestamp: new Date(Date.now() - i * 3600000).toISOString(),
-  transactionHash: `hash-${i + 1}-${Math.random().toString(36).substring(7)}`,
-  walletAddress: MOCK_WALLET_ADDRESS,
-}));
-
 const MOCK_PORTFOLIO_HOLDINGS: PortfolioHolding[] = Array.from({ length: 50 }, (_, i) => ({
   id: `holding-${i + 1}`,
   asset: ['XLM', 'USDC', 'yUSDC', 'RWA'][i % 4],
@@ -196,10 +189,11 @@ const MOCK_VAULT_HISTORY: VaultHistoryPoint[] = Array.from({ length: 365 }, (_, 
 
 // ─── Pagination Configs ─────────────────────────────────────────────────────
 
-const TRANSACTION_PAGINATION_CONFIG: Partial<PaginationConfig> = {
+export const TRANSACTION_PAGINATION_CONFIG: Partial<PaginationConfig> = {
   defaultLimit: 20,
   maxLimit: 100,
   defaultSortBy: 'timestamp',
+  allowedSortBy: ['timestamp', 'type', 'status', 'amount', 'asset', 'walletAddress', 'id'],
   defaultSortOrder: 'desc',
 };
 
@@ -207,6 +201,7 @@ const PORTFOLIO_PAGINATION_CONFIG: Partial<PaginationConfig> = {
   defaultLimit: 20,
   maxLimit: 100,
   defaultSortBy: 'valueUsd',
+  allowedSortBy: ['valueUsd', 'asset', 'vaultName', 'status', 'walletAddress', 'id'],
   defaultSortOrder: 'desc',
 };
 
@@ -214,6 +209,7 @@ const VAULT_HISTORY_PAGINATION_CONFIG: Partial<PaginationConfig> = {
   defaultLimit: 30,
   maxLimit: 365,
   defaultSortBy: 'date',
+  allowedSortBy: ['date', 'value', 'id'],
   defaultSortOrder: 'desc',
 };
 
@@ -290,28 +286,7 @@ function isTransactionInDateRange(
   return true;
 }
 
-function filterTransactionsForExport(
-  query: WalletStateQuery & { startDate?: string; endDate?: string; walletAddress?: string }
-): Transaction[] {
-  const sortBy = query.sortBy ?? TRANSACTION_PAGINATION_CONFIG.defaultSortBy;
-  const sortOrder = query.sortOrder ?? TRANSACTION_PAGINATION_CONFIG.defaultSortOrder ?? 'desc';
-  const from = query.startDate ?? query.from;
-  const to = query.endDate ?? query.to;
 
-  let filtered = filterTransactions(MOCK_TRANSACTIONS, {
-    type: query.type,
-    status: query.status,
-    from,
-    to,
-    walletAddress: query.walletAddress,
-  });
-
-  if (sortBy) {
-    filtered = sortItems(filtered, sortBy, sortOrder);
-  }
-
-  return filtered;
-}
 
 function escapeCsv(value: unknown): string {
   const serialized = String(value ?? '');
@@ -346,11 +321,11 @@ function authenticateTransactionExport(req: ExportRequest, res: Response, next: 
   if (authHeader.startsWith('ApiKey ')) {
     validateApiKey(req, res, () => {
       if (!hasPermission(req, Permission.EXPORTS_WRITE)) {
-        res.status(403).json({
-          error: 'Forbidden',
+        sendApiError(req, res, {
           status: 403,
+          code: 'FORBIDDEN',
           message: 'Operator role or higher is required for admin transaction export',
-          requiredPermission: Permission.EXPORTS_WRITE,
+          details: { requiredPermission: Permission.EXPORTS_WRITE },
         });
         return;
       }
@@ -457,11 +432,27 @@ export async function buildTransactionsResponse(
   query: WalletStateQuery
 ): Promise<PaginatedResponse<Transaction>> {
   const prisma = getPrismaClient();
-  const limit = query.limit ?? TRANSACTION_PAGINATION_CONFIG.defaultLimit ?? 20;
+  // Clamp rather than trust the caller: this builder is reachable from the
+  // routes, from the legacy /api/transactions handler and from the in-process
+  // impersonation snapshot, and a raw parseInt from any of them must not be
+  // able to put a NaN, zero or oversized limit in the envelope.
+  const limit = clampLimitNumber(query.limit, TRANSACTION_PAGINATION_CONFIG);
+  const page = clampPageNumber(query.page);
   const normalizedDateRange = parseDateRangeOrThrow({ from: query.from, to: query.to });
 
-  const sortBy = query.sortBy ?? TRANSACTION_PAGINATION_CONFIG.defaultSortBy ?? 'timestamp';
+  const sortBy = validateSortBy(
+    query.sortBy ?? TRANSACTION_PAGINATION_CONFIG.defaultSortBy ?? 'timestamp',
+    TRANSACTION_PAGINATION_CONFIG,
+  );
   const sortOrder = query.sortOrder ?? TRANSACTION_PAGINATION_CONFIG.defaultSortOrder ?? 'desc';
+  const orderByField =
+    sortBy === 'type' ? 'type' :
+    sortBy === 'status' ? 'status' :
+    sortBy === 'amount' ? 'amount' :
+    sortBy === 'asset' ? 'asset' :
+    sortBy === 'walletAddress' ? 'user' :
+    sortBy === 'id' ? 'id' :
+    'timestamp';
 
   const where = {
     ...(query.type ? { type: query.type } : {}),
@@ -481,12 +472,12 @@ export async function buildTransactionsResponse(
     prisma.transaction.count({ where: where as any }),
     prisma.transaction.findMany({
       where: where as any,
-      orderBy: { [sortBy === 'timestamp' ? 'timestamp' : 'timestamp']: sortOrder },
+      orderBy: { [orderByField]: sortOrder },
       take: limit + 1,
       ...(query.cursor
         ? { cursor: { id: Buffer.from(query.cursor, 'base64url').toString('utf-8') }, skip: 1 }
-        : query.page && query.page > 1
-          ? { skip: (query.page - 1) * limit }
+        : page && page > 1
+          ? { skip: (page - 1) * limit }
           : {}),
     }),
   ]);
@@ -500,10 +491,10 @@ export async function buildTransactionsResponse(
     limit,
     total,
     hasNextPage,
-    hasPrevPage: !!(query.cursor || (query.page && query.page > 1)),
+    hasPrevPage: !!(query.cursor || (page && page > 1)),
     nextCursor: hasNextPage && data.length > 0 ? encodeCursor(data[data.length - 1].id) : null,
-    currentPage: query.page ?? null,
-    totalPages: query.page ? Math.ceil(total / limit) : null,
+    currentPage: page ?? null,
+    totalPages: page ? Math.max(1, Math.ceil(total / limit)) : null,
   });
 
   return createPaginatedResponse(mapped, pagination, {
@@ -512,30 +503,53 @@ export async function buildTransactionsResponse(
   });
 }
 
-export function getTransactionsForExport(query: TransactionExportQuery): Transaction[] {
-  const filters = {
-    type: query.type,
-    status: query.status,
-    from: query.startDate ?? query.from,
-    to: query.endDate ?? query.to,
-    walletAddress: query.walletAddress,
-  };
-  const sortBy = query.sortBy ?? TRANSACTION_PAGINATION_CONFIG.defaultSortBy;
+export async function getTransactionsForExport(query: TransactionExportQuery): Promise<Transaction[]> {
+  const prisma = getPrismaClient();
+  const from = query.startDate ?? query.from;
+  const to = query.endDate ?? query.to;
+  const normalizedDateRange = parseDateRangeOrThrow({ from, to });
+
+  const sortBy = validateSortBy(
+    query.sortBy ?? TRANSACTION_PAGINATION_CONFIG.defaultSortBy ?? 'timestamp',
+    TRANSACTION_PAGINATION_CONFIG,
+  );
   const sortOrder = query.sortOrder ?? TRANSACTION_PAGINATION_CONFIG.defaultSortOrder ?? 'desc';
+  const orderByField =
+    sortBy === 'type' ? 'type' :
+    sortBy === 'status' ? 'status' :
+    sortBy === 'amount' ? 'amount' :
+    sortBy === 'asset' ? 'asset' :
+    sortBy === 'walletAddress' ? 'user' :
+    sortBy === 'id' ? 'id' :
+    'timestamp';
 
-  let filtered = filterTransactions(MOCK_TRANSACTIONS, filters);
-  if (sortBy) {
-    filtered = sortItems(filtered, sortBy, sortOrder);
-  }
+  const where = {
+    ...(query.type ? { type: query.type } : {}),
+    ...(query.status ? { status: query.status } : {}),
+    ...(query.walletAddress ? { user: normalizeWalletAddress(query.walletAddress) } : {}),
+    ...((normalizedDateRange.normalizedStart || normalizedDateRange.normalizedEnd)
+      ? {
+          timestamp: {
+            ...(normalizedDateRange.normalizedStart ? { gte: new Date(normalizedDateRange.normalizedStart) } : {}),
+            ...(normalizedDateRange.normalizedEnd ? { lte: new Date(normalizedDateRange.normalizedEnd) } : {}),
+          },
+        }
+      : {}),
+  };
 
-  return filtered;
+  const rows = await prisma.transaction.findMany({
+    where: where as any,
+    orderBy: { [orderByField]: sortOrder },
+  });
+
+  return rows.map(dbRowToTransaction);
 }
 
-export function buildTransactionExportArtifact(
+export async function buildTransactionExportArtifact(
   format: ExportFormat,
   query: TransactionExportQuery,
-): TransactionExportArtifact {
-  const transactions = getTransactionsForExport(query);
+): Promise<TransactionExportArtifact> {
+  const transactions = await getTransactionsForExport(query);
   const body =
     format === 'csv'
       ? buildTransactionsCsvExportBody(transactions)
@@ -552,9 +566,8 @@ export function buildTransactionExportArtifact(
 }
 
 export function createTransactionsJsonExportStream(query: TransactionExportQuery): Readable {
-  const transactions = getTransactionsForExport(query);
-
   async function* generate(): AsyncGenerator<string> {
+    const transactions = await getTransactionsForExport(query);
     yield '{"data":[';
     for (let index = 0; index < transactions.length; index += 1) {
       if (index > 0) {
@@ -569,7 +582,6 @@ export function createTransactionsJsonExportStream(query: TransactionExportQuery
 }
 
 export function createTransactionsCsvExportStream(query: TransactionExportQuery): Readable {
-  const transactions = getTransactionsForExport(query);
   const columns: Array<keyof Transaction> = [
     'id',
     'type',
@@ -582,6 +594,7 @@ export function createTransactionsCsvExportStream(query: TransactionExportQuery)
   ];
 
   async function* generate(): AsyncGenerator<string> {
+    const transactions = await getTransactionsForExport(query);
     yield `${columns.join(',')}\r\n`;
     for (const transaction of transactions) {
       const row = columns
@@ -626,10 +639,14 @@ function escapeCsvValue(value: unknown): string {
 export function buildPortfolioHoldingsResponse(
   query: WalletStateQuery
 ): PaginatedResponse<PortfolioHolding> {
+  const sortBy = validateSortBy(
+    query.sortBy ?? PORTFOLIO_PAGINATION_CONFIG.defaultSortBy,
+    PORTFOLIO_PAGINATION_CONFIG,
+  );
   const pagination = {
-    limit: query.limit ?? PORTFOLIO_PAGINATION_CONFIG.defaultLimit ?? 20,
+    limit: clampLimitNumber(query.limit, PORTFOLIO_PAGINATION_CONFIG),
     cursor: query.cursor,
-    sortBy: query.sortBy ?? PORTFOLIO_PAGINATION_CONFIG.defaultSortBy,
+    sortBy,
     sortOrder: query.sortOrder ?? PORTFOLIO_PAGINATION_CONFIG.defaultSortOrder ?? 'desc',
   };
   const filters = {
@@ -652,10 +669,14 @@ export function buildPortfolioHoldingsResponse(
 export function buildVaultHistoryResponse(
   query: Pick<WalletStateQuery, 'limit' | 'cursor' | 'sortBy' | 'sortOrder' | 'from' | 'to'>
 ): PaginatedResponse<VaultHistoryPoint> {
+  const sortBy = validateSortBy(
+    query.sortBy ?? VAULT_HISTORY_PAGINATION_CONFIG.defaultSortBy,
+    VAULT_HISTORY_PAGINATION_CONFIG,
+  );
   const pagination = {
-    limit: query.limit ?? VAULT_HISTORY_PAGINATION_CONFIG.defaultLimit ?? 30,
+    limit: clampLimitNumber(query.limit, VAULT_HISTORY_PAGINATION_CONFIG),
     cursor: query.cursor,
-    sortBy: query.sortBy ?? VAULT_HISTORY_PAGINATION_CONFIG.defaultSortBy,
+    sortBy,
     sortOrder: query.sortOrder ?? VAULT_HISTORY_PAGINATION_CONFIG.defaultSortOrder ?? 'desc',
   };
   const filters = {
@@ -757,110 +778,38 @@ router.get('/transactions',
     res.status(200).json(response);
   } catch (error) {
     if (error instanceof DateRangeParseError) {
-      res.status(400).json({
-        error: 'Bad Request',
+      sendApiError(req, res, {
         status: 400,
+        code: 'BAD_REQUEST',
         message: error.message,
       });
       return;
     }
-    console.error('Error fetching transactions:', error);
-    res.status(500).json({
-      error: 'Internal Server Error',
+    if (error instanceof Error && /Invalid sortBy value/.test(error.message)) {
+      logger.log('warn', 'Rejected invalid transaction sort field', {
+        requestedSortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+        allowedSortBy: TRANSACTION_PAGINATION_CONFIG.allowedSortBy,
+        error: error.message,
+      });
+      sendApiError(req, res, {
+        status: 400,
+        code: 'BAD_REQUEST',
+        message: error.message,
+      });
+      return;
+    }
+    logger.log('error', 'Error fetching transactions', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    sendApiError(req, res, {
       status: 500,
+      code: 'INTERNAL_SERVER_ERROR',
       message: 'Failed to fetch transactions',
     });
   }
 });
 
-router.get('/vault/transactions/export', 
-  authenticateTransactionExport, 
-  createTimeoutFor.export(), 
-  async (req: Request, res: Response) => {
-  const exportReq = req as ExportRequest;
-  const format = resolveExportFormat(req.query.format);
-  if (!format) {
-    res.status(400).json({
-      error: 'Bad Request',
-      status: 400,
-      message: 'format query parameter must be either csv or json',
-    });
-    return;
-  }
-
-  const requestedWallet = typeof req.query.walletAddress === 'string' ? req.query.walletAddress : undefined;
-  const walletAddress = exportReq.exportAsAdmin
-    ? requestedWallet
-    : exportReq.jwtPayload?.sub;
-
-  if (!exportReq.exportAsAdmin && requestedWallet && requestedWallet !== exportReq.jwtPayload?.sub) {
-    res.status(403).json({
-      error: 'Forbidden',
-      status: 403,
-      message: 'Users can only export their own wallet transaction history',
-    });
-    return;
-  }
-
-  if (!walletAddress) {
-    res.status(400).json({
-      error: 'Bad Request',
-      status: 400,
-      message: 'walletAddress is required for admin exports',
-    });
-    return;
-  }
-
-  const stamp = new Date().toISOString().slice(0, 10);
-  const fileBase = `transaction-history-${walletAddress.slice(0, 8)}-${stamp}`;
-  const fileName = `${fileBase}.${format}`;
-
-  try {
-    const artifact = buildTransactionExportArtifact(format, {
-      type: typeof req.query.type === 'string' ? req.query.type : undefined,
-      status: typeof req.query.status === 'string' ? req.query.status : undefined,
-      sortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
-      sortOrder: req.query.sortOrder === 'asc' ? 'asc' : 'desc',
-      startDate: typeof req.query.startDate === 'string' ? req.query.startDate : undefined,
-      endDate: typeof req.query.endDate === 'string' ? req.query.endDate : undefined,
-      walletAddress,
-    });
-
-    const job = await recordExportJob({
-      format,
-      fileName,
-      contentType: artifact.contentType,
-      checksum: artifact.checksum,
-      checksumAlgorithm: artifact.checksumAlgorithm,
-      generatedBy: resolveExportGeneratedBy(req),
-      walletAddress,
-      rowCount: artifact.rowCount,
-      filters: {
-        type: typeof req.query.type === 'string' ? req.query.type : null,
-        status: typeof req.query.status === 'string' ? req.query.status : null,
-        sortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : null,
-        sortOrder: req.query.sortOrder === 'asc' ? 'asc' : 'desc',
-        startDate: typeof req.query.startDate === 'string' ? req.query.startDate : null,
-        endDate: typeof req.query.endDate === 'string' ? req.query.endDate : null,
-        walletAddress,
-      },
-    });
-
-    res.setHeader('Content-Type', artifact.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    res.setHeader('X-Export-Job-Id', job.id);
-    res.setHeader('X-Export-Checksum', artifact.checksum);
-    res.setHeader('X-Export-Checksum-Algorithm', artifact.checksumAlgorithm);
-    res.setHeader('X-Export-Metadata', buildExportMetadataHeaderValue(job));
-    res.status(200).send(artifact.body);
-  } catch (error) {
-    res.status(500).json({
-      error: 'Internal Server Error',
-      status: 500,
-      message: error instanceof Error ? error.message : 'Failed to generate transaction export',
-    });
-  }
-});
 
 /**
  * @openapi
@@ -903,10 +852,26 @@ router.get('/portfolio/holdings',
 
     sendPaginatedResponse(res, response.data, response.pagination);
   } catch (error) {
-    console.error('Error fetching portfolio holdings:', error);
-    res.status(500).json({
-      error: 'Internal Server Error',
+    if (error instanceof Error && /Invalid sortBy value/.test(error.message)) {
+      logger.log('warn', 'Rejected invalid portfolio sort field', {
+        requestedSortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+        allowedSortBy: PORTFOLIO_PAGINATION_CONFIG.allowedSortBy,
+        error: error.message,
+      });
+      sendApiError(req, res, {
+        status: 400,
+        code: 'BAD_REQUEST',
+        message: error.message,
+      });
+      return;
+    }
+    logger.log('error', 'Error fetching portfolio holdings', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    sendApiError(req, res, {
       status: 500,
+      code: 'INTERNAL_SERVER_ERROR',
       message: 'Failed to fetch portfolio holdings',
     });
   }
@@ -949,17 +914,33 @@ router.get('/vault/history',
     res.status(200).json(response);
   } catch (error) {
     if (error instanceof DateRangeParseError) {
-      res.status(400).json({
-        error: 'Bad Request',
+      sendApiError(req, res, {
         status: 400,
+        code: 'BAD_REQUEST',
         message: error.message,
       });
       return;
     }
-    console.error('Error fetching vault history:', error);
-    res.status(500).json({
-      error: 'Internal Server Error',
+    if (error instanceof Error && /Invalid sortBy value/.test(error.message)) {
+      logger.log('warn', 'Rejected invalid vault history sort field', {
+        requestedSortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+        allowedSortBy: VAULT_HISTORY_PAGINATION_CONFIG.allowedSortBy,
+        error: error.message,
+      });
+      sendApiError(req, res, {
+        status: 400,
+        code: 'BAD_REQUEST',
+        message: error.message,
+      });
+      return;
+    }
+    logger.log('error', 'Error fetching vault history', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    sendApiError(req, res, {
       status: 500,
+      code: 'INTERNAL_SERVER_ERROR',
       message: 'Failed to fetch vault history',
     });
   }
@@ -1015,10 +996,13 @@ router.get('/vault/apy/history',
       count: data.length,
     });
   } catch (err) {
-    console.error('Error fetching APY history:', err);
-    res.status(500).json({
-      error: 'Internal Server Error',
+    logger.log('error', 'Error fetching APY history', {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+    sendApiError(req, res, {
       status: 500,
+      code: 'INTERNAL_SERVER_ERROR',
       message: 'Failed to fetch APY history',
     });
   }

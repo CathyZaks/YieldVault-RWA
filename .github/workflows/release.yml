@@ -3,15 +3,17 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   release:
     name: Generate changelog and publish release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -41,19 +43,58 @@ jobs:
           OUTPUT: /tmp/release-notes.md
           GITHUB_REPO: ${{ github.repository }}
 
-      # Commit the updated CHANGELOG.md back to the default branch
-      - name: Commit CHANGELOG.md
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          # Only commit if there are changes
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): update CHANGELOG.md for ${{ github.ref_name }}"
-            git push origin HEAD:refs/heads/main
-          fi
+      # Open a PR for CHANGELOG.md updates to comply with branch protection
+      - name: Create Pull Request for CHANGELOG.md
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(release): update CHANGELOG.md for ${{ github.ref_name }}"
+          title: "chore(release): update CHANGELOG.md for ${{ github.ref_name }}"
+          body: "Automated changelog update for release ${{ github.ref_name }}."
+          branch: "chore/changelog-${{ github.ref_name }}"
+          base: "main"
 
-      # Create the GitHub Release with the generated notes
+      # Build Rust workspace
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust workspace
+        run: cargo build --release --workspace
+
+      # Build frontend
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.12.0 --activate
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: pnpm build
+
+      # Generate SBOM for Rust workspace
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom
+
+      - name: Generate Rust SBOM
+        run: cargo sbom --output-format spdx_json_2_3 > rust-sbom.spdx.json
+
+      # Generate SBOM for frontend
+      - name: Generate Frontend SBOM
+        working-directory: ./frontend
+        run: |
+          npm install -g @cyclonedx/cyclonedx-npm
+          cyclonedx-npm --output-file ../frontend-sbom.json
+
+      # Create the GitHub Release with the generated notes and SBOMs
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -62,3 +103,6 @@ jobs:
           body_path: /tmp/release-notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            rust-sbom.spdx.json
+            frontend-sbom.json

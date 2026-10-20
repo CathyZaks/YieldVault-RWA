@@ -26,6 +26,7 @@
 //! - Nonce-based replay protection
 //! - Graceful degradation on provider failures
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
     Bytes, Env, String, Vec,
@@ -49,6 +50,30 @@ pub enum BridgeError {
     NonceAlreadyUsed = 10,
     NoFallbackAvailable = 11,
     ProviderDisabled = 12,
+    TimelockNotReady = 13,
+    NoPendingRemoval = 14,
+    ArithmeticOverflow = 15,
+    InvalidLimits = 16,
+}
+
+// ── Bridge endpoint interface ──────────────────────────────────────────────
+
+/// Interface every bridge provider endpoint contract must expose.
+///
+/// The bridge layer keeps custody of the locked tokens (so failed transfers
+/// can be refunded) and notifies the endpoint to relay the message. Any
+/// error or panic from `send` is treated as a provider failure and the
+/// transfer is routed to the next eligible provider.
+#[contractclient(name = "BridgeEndpointClient")]
+pub trait BridgeEndpoint {
+    fn send(
+        env: Env,
+        transfer_id: u64,
+        token: Address,
+        amount: i128,
+        dest_chain: u32,
+        recipient: Bytes,
+    );
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -157,14 +182,31 @@ enum DataKey {
     UserTransferCount(Address),
     EpochVolume,
     EpochStart,
+    EpochAccounting,
     Limits,
     DefaultProvider,
+    TransferNonceFor(Address, u32),
+    MinTransfer,
+    PendingRemoval(u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EpochAccounting {
+    start: u64,
+    volume: i128,
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const STELLAR_CHAIN_ID: u32 = 0;
 const BPS_DENOMINATOR: i128 = 10_000;
+const STORAGE_TTL_THRESHOLD: u32 = 10_000;
+const STORAGE_TTL_EXTENSION: u32 = 100_000;
+/// Default minimum transfer amount when none is configured.
+const DEFAULT_MIN_TRANSFER: i128 = 1;
+/// Delay between queueing and executing a provider removal.
+pub const PROVIDER_REMOVAL_DELAY: u64 = 86_400;
 
 // ── Contract ───────────────────────────────────────────────────────────────
 
@@ -226,13 +268,18 @@ impl BridgeCompat {
         if !(0..=BPS_DENOMINATOR).contains(&fee_bps) {
             return Err(BridgeError::InvalidAmount);
         }
+        // Bound max_transfer so fee math (amount * fee_bps) cannot overflow.
+        if max_transfer <= 0 || max_transfer > i128::MAX / BPS_DENOMINATOR {
+            return Err(BridgeError::InvalidLimits);
+        }
 
         let provider_id = env
             .storage()
             .instance()
             .get::<_, u32>(&DataKey::ProviderNonce)
             .unwrap_or(0)
-            + 1;
+            .checked_add(1)
+            .ok_or(BridgeError::ArithmeticOverflow)?;
 
         let provider = BridgeProvider {
             id: provider_id,
@@ -245,9 +292,7 @@ impl BridgeCompat {
             supported_chains,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider_id), &provider);
+        Self::set_provider(&env, provider_id, &provider);
         env.storage()
             .instance()
             .set(&DataKey::ProviderNonce, &provider_id);
@@ -277,9 +322,7 @@ impl BridgeCompat {
         Self::require_admin(&env)?;
         let mut provider = Self::get_provider(&env, provider_id)?;
         provider.enabled = enabled;
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider_id), &provider);
+        Self::set_provider(&env, provider_id, &provider);
         env.events()
             .publish((symbol_short!("brgtog"),), (provider_id, enabled));
         Ok(())
@@ -293,9 +336,7 @@ impl BridgeCompat {
         }
         let mut provider = Self::get_provider(&env, provider_id)?;
         provider.fee_bps = fee_bps;
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider_id), &provider);
+        Self::set_provider(&env, provider_id, &provider);
         Ok(())
     }
 
@@ -309,6 +350,70 @@ impl BridgeCompat {
         env.events()
             .publish((symbol_short!("brgdef"),), (provider_id,));
         Ok(())
+    }
+
+    /// Queue removal of a provider. Admin-only; executable after
+    /// [`PROVIDER_REMOVAL_DELAY`]. Returns the earliest execution time.
+    pub fn queue_unregister_provider(env: Env, provider_id: u32) -> Result<u64, BridgeError> {
+        Self::require_admin(&env)?;
+        let _ = Self::get_provider(&env, provider_id)?; // validate exists
+        let eta = env
+            .ledger()
+            .timestamp()
+            .checked_add(PROVIDER_REMOVAL_DELAY)
+            .ok_or(BridgeError::InvalidAmount)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingRemoval(provider_id), &eta);
+        env.events()
+            .publish((symbol_short!("brgrmq"),), (provider_id, eta));
+        Ok(eta)
+    }
+
+    /// Cancel a queued provider removal. Admin-only.
+    pub fn cancel_unregister_provider(env: Env, provider_id: u32) -> Result<(), BridgeError> {
+        Self::require_admin(&env)?;
+        let key = DataKey::PendingRemoval(provider_id);
+        if !env.storage().instance().has(&key) {
+            return Err(BridgeError::NoPendingRemoval);
+        }
+        env.storage().instance().remove(&key);
+        env.events()
+            .publish((symbol_short!("brgrmc"),), (provider_id,));
+        Ok(())
+    }
+
+    /// Remove a provider once its queued removal timelock has elapsed.
+    /// Admin-only. Clears the default provider if it pointed at this one.
+    pub fn unregister_provider(env: Env, provider_id: u32) -> Result<(), BridgeError> {
+        Self::require_admin(&env)?;
+        let pending_key = DataKey::PendingRemoval(provider_id);
+        let eta: u64 = env
+            .storage()
+            .instance()
+            .get(&pending_key)
+            .ok_or(BridgeError::NoPendingRemoval)?;
+        if env.ledger().timestamp() < eta {
+            return Err(BridgeError::TimelockNotReady);
+        }
+        let _ = Self::get_provider(&env, provider_id)?;
+
+        let key = DataKey::Provider(provider_id);
+        env.storage().persistent().remove(&key);
+        env.storage().instance().remove(&pending_key);
+        if Self::default_provider(env.clone()) == Some(provider_id) {
+            env.storage().instance().remove(&DataKey::DefaultProvider);
+        }
+        env.events()
+            .publish((symbol_short!("brgrm"),), (provider_id,));
+        Ok(())
+    }
+
+    /// Returns the earliest execution time of a queued provider removal.
+    pub fn pending_unregister(env: Env, provider_id: u32) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingRemoval(provider_id))
     }
 
     /// Returns a provider by ID.
@@ -334,8 +439,36 @@ impl BridgeCompat {
     /// Update transfer limits. Admin-only.
     pub fn set_transfer_limits(env: Env, limits: TransferLimits) -> Result<(), BridgeError> {
         Self::require_admin(&env)?;
+        if limits.per_transfer_limit <= 0
+            || limits.epoch_volume_limit <= 0
+            || limits.per_transfer_limit > limits.epoch_volume_limit
+            || limits.epoch_duration == 0
+        {
+            return Err(BridgeError::InvalidLimits);
+        }
         env.storage().instance().set(&DataKey::Limits, &limits);
         Ok(())
+    }
+
+    /// Set the minimum amount accepted by `transfer_out` / `estimate_transfer`.
+    /// Admin-only; must be positive.
+    pub fn set_min_transfer(env: Env, min_transfer: i128) -> Result<(), BridgeError> {
+        Self::require_admin(&env)?;
+        if min_transfer <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinTransfer, &min_transfer);
+        Ok(())
+    }
+
+    /// Returns the minimum transfer amount.
+    pub fn min_transfer(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinTransfer)
+            .unwrap_or(DEFAULT_MIN_TRANSFER)
     }
 
     /// Returns the current transfer limits.
@@ -367,15 +500,18 @@ impl BridgeCompat {
         if !provider.enabled {
             return Err(BridgeError::ProviderDisabled);
         }
-        if !provider.supported_chains.contains(&dest_chain) {
+        if !provider.supported_chains.contains(dest_chain) {
             return Err(BridgeError::ProviderNotFound);
         }
-        if amount <= 0 || amount > provider.max_transfer {
-            return Err(BridgeError::InvalidAmount);
-        }
+        Self::check_amount_bounds(&env, &provider, amount)?;
 
-        let fee_amount = amount * provider.fee_bps / BPS_DENOMINATOR;
-        let receive_amount = amount - fee_amount;
+        let fee_amount = amount
+            .checked_mul(provider.fee_bps)
+            .ok_or(BridgeError::ArithmeticOverflow)?
+            / BPS_DENOMINATOR;
+        let receive_amount = amount
+            .checked_sub(fee_amount)
+            .ok_or(BridgeError::ArithmeticOverflow)?;
 
         Ok(TransferEstimate {
             provider_id: pid,
@@ -387,10 +523,12 @@ impl BridgeCompat {
 
     /// Initiate a cross-chain USDC transfer.
     ///
-    /// Pulls USDC from the sender, records the transfer, and (in production)
-    /// would call the bridge endpoint contract. This implementation handles
-    /// the vault-side accounting; the actual bridge call is abstracted for
-    /// testnet compatibility.
+    /// Pulls USDC from the sender into this contract's custody, then invokes
+    /// the selected provider's [`BridgeEndpoint::send`]. If the primary
+    /// endpoint fails, the transfer is routed to the next enabled provider
+    /// (ascending ID) that supports `dest_chain`; if none succeeds the call
+    /// reverts with [`BridgeError::NoFallbackAvailable`]. The recorded
+    /// transfer carries the provider that actually accepted it.
     pub fn transfer_out(
         env: Env,
         sender: Address,
@@ -409,12 +547,10 @@ impl BridgeCompat {
         if !provider.enabled {
             return Err(BridgeError::ProviderDisabled);
         }
-        if !provider.supported_chains.contains(&dest_chain) {
+        if !provider.supported_chains.contains(dest_chain) {
             return Err(BridgeError::ProviderNotFound);
         }
-        if amount <= 0 {
-            return Err(BridgeError::InvalidAmount);
-        }
+        Self::check_amount_bounds(&env, &provider, amount)?;
 
         // Check per-transfer limit
         let limits: TransferLimits =
@@ -433,29 +569,57 @@ impl BridgeCompat {
         // Check epoch volume
         Self::check_epoch_volume(&env, amount, &limits)?;
 
-        // Check token balance
+        // Check the sender can fund the transfer
         let token_addr: Address = env.storage().instance().get(&DataKey::TokenAsset).unwrap();
         let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
-        let balance = token_client.balance(&env.current_contract_address());
+        let balance = token_client.balance(&sender);
         if balance < amount {
             return Err(BridgeError::InsufficientBalance);
         }
 
-        // Transfer tokens from sender to this contract
+        // Lock the sender's tokens before routing; any failure below reverts it.
         token_client.transfer(&sender, &env.current_contract_address(), &amount);
 
-        // Create transfer record
-        let transfer_id = env
-            .storage()
-            .instance()
-            .get::<_, u64>(&DataKey::TransferNonce)
-            .unwrap_or(0)
-            + 1;
-        let nonce = env
-            .storage()
-            .instance()
-            .get::<_, u64>(&DataKey::TransferNonce)
-            .unwrap_or(0);
+        // Primary first, then every other eligible provider as fallback.
+        let mut routed: Option<(u32, u64, u64)> = None;
+        let (nonce, transfer_id) = Self::next_transfer_id(&env, &sender, pid)?;
+        if Self::call_endpoint(
+            &env,
+            &provider,
+            transfer_id,
+            &token_addr,
+            amount,
+            dest_chain,
+            &recipient,
+        ) {
+            routed = Some((pid, nonce, transfer_id));
+        } else {
+            for fallback_id in 1..=Self::provider_count(env.clone()) {
+                if fallback_id == pid {
+                    continue;
+                }
+                let fallback = match Self::get_provider(&env, fallback_id) {
+                    Ok(p) if p.enabled && p.supported_chains.contains(dest_chain) => p,
+                    _ => continue,
+                };
+                let (nonce, transfer_id) = Self::next_transfer_id(&env, &sender, fallback_id)?;
+                if Self::call_endpoint(
+                    &env,
+                    &fallback,
+                    transfer_id,
+                    &token_addr,
+                    amount,
+                    dest_chain,
+                    &recipient,
+                ) {
+                    env.events()
+                        .publish((symbol_short!("brgfbk"),), (pid, fallback_id, transfer_id));
+                    routed = Some((fallback_id, nonce, transfer_id));
+                    break;
+                }
+            }
+        }
+        let (used_pid, nonce, transfer_id) = routed.ok_or(BridgeError::NoFallbackAvailable)?;
 
         let transfer = BridgeTransfer {
             transfer_id,
@@ -464,7 +628,7 @@ impl BridgeCompat {
             amount,
             source_chain: STELLAR_CHAIN_ID,
             dest_chain,
-            provider_id: pid,
+            provider_id: used_pid,
             status: TransferStatus::InFlight,
             created_at: env.ledger().timestamp(),
             completed_at: 0,
@@ -476,7 +640,7 @@ impl BridgeCompat {
             .set(&DataKey::Transfer(transfer_id), &transfer);
         env.storage()
             .instance()
-            .set(&DataKey::TransferNonce, &(transfer_id));
+            .set(&DataKey::TransferNonceFor(sender.clone(), used_pid), &nonce);
 
         // Update user transfer count
         let user_count: i128 = env
@@ -484,14 +648,16 @@ impl BridgeCompat {
             .instance()
             .get(&DataKey::UserTransferCount(sender.clone()))
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::UserTransferCount(sender.clone()),
-            &(user_count + 1),
-        );
+        let new_user_count = user_count
+            .checked_add(1)
+            .ok_or(BridgeError::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UserTransferCount(sender.clone()), &new_user_count);
 
         env.events().publish(
-            (symbol_short!("brgout"), sender),
-            (transfer_id, amount, dest_chain, pid),
+            (symbol_short!("brgout"), sender.clone()),
+            (transfer_id, amount, dest_chain, used_pid),
         );
 
         Ok(transfer_id)
@@ -595,11 +761,99 @@ impl BridgeCompat {
         Ok(admin)
     }
 
+    /// Enforces `min_transfer <= amount <= provider.max_transfer`.
+    fn check_amount_bounds(
+        env: &Env,
+        provider: &BridgeProvider,
+        amount: i128,
+    ) -> Result<(), BridgeError> {
+        let min_transfer = Self::min_transfer(env.clone());
+        if amount < min_transfer || amount > provider.max_transfer {
+            return Err(BridgeError::InvalidAmount);
+        }
+        Ok(())
+    }
+
     fn get_provider(env: &Env, provider_id: u32) -> Result<BridgeProvider, BridgeError> {
-        env.storage()
+        let key = DataKey::Provider(provider_id);
+        if let Some(provider) = env.storage().persistent().get(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                STORAGE_TTL_THRESHOLD,
+                STORAGE_TTL_EXTENSION,
+            );
+            return Ok(provider);
+        }
+
+        // Migrate providers created by earlier releases out of instance storage.
+        let provider: BridgeProvider = env
+            .storage()
             .instance()
-            .get(&DataKey::Provider(provider_id))
-            .ok_or(BridgeError::ProviderNotFound)
+            .get(&key)
+            .ok_or(BridgeError::ProviderNotFound)?;
+        Self::set_provider(env, provider_id, &provider);
+        env.storage().instance().remove(&key);
+        Ok(provider)
+    }
+
+    fn set_provider(env: &Env, provider_id: u32, provider: &BridgeProvider) {
+        let key = DataKey::Provider(provider_id);
+        env.storage().persistent().set(&key, provider);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, STORAGE_TTL_THRESHOLD, STORAGE_TTL_EXTENSION);
+    }
+
+    /// Next unused (nonce, transfer_id) for the sender/provider domain.
+    fn next_transfer_id(
+        env: &Env,
+        sender: &Address,
+        provider_id: u32,
+    ) -> Result<(u64, u64), BridgeError> {
+        // Nonces are monotonic within a sender/provider domain. Transfer IDs
+        // additionally bind that nonce to both identities so they cannot be
+        // confused with replay nonces or reused across providers.
+        let nonce = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::TransferNonceFor(sender.clone(), provider_id))
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(BridgeError::NonceAlreadyUsed)?;
+        let transfer_id = Self::derive_transfer_id(env, sender, nonce, provider_id);
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Transfer(transfer_id))
+        {
+            return Err(BridgeError::NonceAlreadyUsed);
+        }
+        Ok((nonce, transfer_id))
+    }
+
+    /// Invoke the provider endpoint; `false` on any error or panic.
+    fn call_endpoint(
+        env: &Env,
+        provider: &BridgeProvider,
+        transfer_id: u64,
+        token: &Address,
+        amount: i128,
+        dest_chain: u32,
+        recipient: &Bytes,
+    ) -> bool {
+        BridgeEndpointClient::new(env, &provider.endpoint)
+            .try_send(&transfer_id, token, &amount, &dest_chain, recipient)
+            .is_ok()
+    }
+
+    fn derive_transfer_id(env: &Env, sender: &Address, nonce: u64, provider_id: u32) -> u64 {
+        let mut payload = sender.to_xdr(env);
+        payload.append(&nonce.to_xdr(env));
+        payload.append(&provider_id.to_xdr(env));
+        let digest = env.crypto().sha256(&payload).to_array();
+        u64::from_be_bytes([
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+        ])
     }
 
     fn check_epoch_volume(
@@ -608,127 +862,55 @@ impl BridgeCompat {
         limits: &TransferLimits,
     ) -> Result<(), BridgeError> {
         let now = env.ledger().timestamp();
-        let epoch_start: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EpochStart)
-            .unwrap_or(0);
-        let mut epoch_volume: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EpochVolume)
-            .unwrap_or(0);
+        let persistent = env.storage().persistent();
+        let accounting_key = DataKey::EpochAccounting;
+        let mut accounting: EpochAccounting =
+            if let Some(accounting) = persistent.get(&accounting_key) {
+                accounting
+            } else {
+                let instance = env.storage().instance();
+                let legacy_start: Option<u64> = instance.get(&DataKey::EpochStart);
+                let legacy_volume: Option<i128> = instance.get(&DataKey::EpochVolume);
+                if legacy_start.is_some() {
+                    instance.remove(&DataKey::EpochStart);
+                }
+                if legacy_volume.is_some() {
+                    instance.remove(&DataKey::EpochVolume);
+                }
+                EpochAccounting {
+                    start: legacy_start.unwrap_or(0),
+                    volume: legacy_volume.unwrap_or(0),
+                }
+            };
 
         // Reset epoch if expired
-        if now >= epoch_start + limits.epoch_duration {
-            epoch_volume = 0;
-            env.storage().instance().set(&DataKey::EpochStart, &now);
+        let epoch_end = accounting
+            .start
+            .checked_add(limits.epoch_duration)
+            .ok_or(BridgeError::ArithmeticOverflow)?;
+        if now >= epoch_end {
+            accounting.volume = 0;
+            accounting.start = now;
         }
 
-        let new_volume = epoch_volume
+        let new_volume = accounting
+            .volume
             .checked_add(amount)
             .ok_or(BridgeError::TransferLimitExceeded)?;
         if new_volume > limits.epoch_volume_limit {
             return Err(BridgeError::TransferLimitExceeded);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::EpochVolume, &new_volume);
+        accounting.volume = new_volume;
+        persistent.set(&accounting_key, &accounting);
+        persistent.extend_ttl(
+            &accounting_key,
+            STORAGE_TTL_THRESHOLD,
+            STORAGE_TTL_EXTENSION,
+        );
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-
-    /// Register the contract and return a client for it.
-    ///
-    /// The tests below went through `BridgeCompat::…` directly, which reads
-    /// instance storage outside a contract invocation. SDK 22 rejects that
-    /// ("this function is not accessible outside of a contract"), so they now
-    /// go through the generated client like every other test in the workspace.
-    fn setup() -> (Env, BridgeCompatClient<'static>) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(BridgeCompat, ());
-        let client = BridgeCompatClient::new(&env, &id);
-        (env, client)
-    }
-
-    #[test]
-    fn test_initialize() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let token = Address::generate(&env);
-
-        client.initialize(&admin, &token);
-        assert_eq!(client.admin(), Some(admin));
-        assert_eq!(client.token(), Some(token));
-    }
-
-    #[test]
-    fn test_double_initialize_fails() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let token = Address::generate(&env);
-
-        client.initialize(&admin, &token);
-        let result = client.try_initialize(&admin, &token);
-        assert_eq!(result, Err(Ok(BridgeError::AlreadyInitialized)));
-    }
-
-    #[test]
-    fn test_register_provider() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let token = Address::generate(&env);
-        let endpoint = Address::generate(&env);
-
-        client.initialize(&admin, &token);
-
-        let chains = Vec::from_array(&env, &[1, 2, 3]);
-        let id = BridgeCompat::register_provider(
-            env.clone(),
-            String::from_str(&env, "Wormhole"),
-            BridgeProviderKind::Wormhole,
-            endpoint,
-            50, // 0.5% fee
-            1_000_000_000_000,
-            chains,
-        )
-        .unwrap();
-        let chains = Vec::from_array(&env, [1, 2, 3]);
-        let id = client.register_provider(
-            &String::from_str(&env, "Wormhole"),
-            &BridgeProviderKind::Wormhole,
-            &endpoint,
-            &50, // 0.5% fee
-            &1_000_000_000_000,
-            &chains,
-        );
-
-        assert_eq!(id, 1);
-        assert_eq!(client.provider_count(), 1);
-
-        let provider = client.provider(&id).unwrap();
-        assert_eq!(provider.name, String::from_str(&env, "Wormhole"));
-        assert!(provider.enabled);
-    }
-
-    #[test]
-    fn test_transfer_limits() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let token = Address::generate(&env);
-
-        client.initialize(&admin, &token);
-
-        let limits = client.transfer_limits();
-        assert_eq!(limits.per_transfer_limit, 1_000_000_000_000);
-        assert_eq!(limits.epoch_volume_limit, 10_000_000_000_000);
-        assert_eq!(limits.epoch_duration, 86_400);
-    }
-}
+mod test;

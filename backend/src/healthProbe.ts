@@ -8,23 +8,25 @@ export interface DependencyProbeState {
   lastError: string | null;
   lastErrorAt: string | null;
   consecutiveFailures: number;
+  optional?: boolean;
 }
 
-export type DependencyName = 'database' | 'cache' | 'stellarRpc' | 'prisma' | 'queue' | 'indexer';
+export type DependencyName = 'database' | 'cache' | 'stellarRpc' | 'prisma' | 'queue' | 'indexer' | 'redis';
 
 type ProbeFunction = () => Promise<'up' | 'down'>;
 
 interface ProbeRegistration {
   name: DependencyName;
   probe: ProbeFunction;
+  optional?: boolean;
 }
 
 class HealthProbeService {
   private probes = new Map<DependencyName, ProbeRegistration>();
   private states = new Map<DependencyName, DependencyProbeState>();
 
-  register(name: DependencyName, probe: ProbeFunction): void {
-    this.probes.set(name, { name, probe });
+  register(name: DependencyName, probe: ProbeFunction, options?: { optional?: boolean }): void {
+    this.probes.set(name, { name, probe, optional: options?.optional });
     if (!this.states.has(name)) {
       this.states.set(name, {
         status: 'up',
@@ -33,6 +35,7 @@ class HealthProbeService {
         lastError: null,
         lastErrorAt: null,
         consecutiveFailures: 0,
+        optional: options?.optional,
       });
     }
   }
@@ -110,8 +113,12 @@ class HealthProbeService {
   }
 
   isHealthy(): boolean {
-    for (const state of this.states.values()) {
-      if (state.status === 'down') return false;
+    for (const [name, state] of this.states) {
+      if (state.status === 'down') {
+        const registration = this.probes.get(name);
+        if (registration?.optional) continue;
+        return false;
+      }
     }
     return true;
   }

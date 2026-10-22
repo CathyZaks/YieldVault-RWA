@@ -399,7 +399,18 @@ pub struct StrategyProposal {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 /// Pending large withdrawal with 24-hour timelock.
+///
+/// ## Share Price Behavior
+///
+/// The shares recorded here are NOT reserved or priced at request time.
+/// When `execute_withdrawal` is called after the timelock expires, the shares
+/// are converted to assets using the then-current `total_assets` and `total_shares`.
+/// This means the user's effective share price depends on what happens during the
+/// timelock period (yield accrual, deposits, other withdrawals, etc.).
+///
+/// Related: issue #1683
 pub struct PendingWithdrawal {
     pub shares: i128,
     pub unlock_timestamp: u64,
@@ -870,11 +881,6 @@ impl YieldVault {
                 .get(&DataKey::LastStrategySwitchTime)
                 .unwrap_or(0);
             let earliest_switch = last_switch.saturating_add(cooldown);
-            if env.ledger().timestamp() < earliest_switch {
-            let earliest_switch = last_switch.checked_add(cooldown).expect("overflow");
-            if now < earliest_switch {
-                return Err(VaultError::AdminParamChangeTooSoon);
-            }
         }
 
         let current_strategy = Self::strategy(env.clone());
@@ -1827,26 +1833,7 @@ impl YieldVault {
                     .map_err(|_| VaultError::OracleValidationFailed)?;
                     Self::set_last_oracle_price(&env, &price_data);
                 }
-        let token = Self::token(env.clone());
-        if Self::is_oracle_enabled(env.clone()) {
-            if let Some(oracle_addr) = Self::price_oracle(env.clone()) {
-                let oracle_client = OracleClient::new(&env, &oracle_addr);
-                let price_data = oracle_client.get_price(&token, &token);
-                let max_age = Self::oracle_heartbeat(env.clone());
-                let last_price = Self::last_oracle_price(&env);
-                oracle::OracleValidator::validate_price_data(
-                    &env,
-                    &price_data,
-                    max_age,
-                    Some(oracle::MAX_PRICE_DEVIATION_BPS),
-                    last_price.as_ref(),
-                )
-                .map_err(|_| VaultError::OracleValidationFailed)?;
-                Self::set_last_oracle_price(&env, &price_data);
             }
-        }
-
-        let strategy_assets = if let Some(strategy_addr) = Self::strategy(env.clone()) {
             Self::require_valid_strategy_response(&env, &strategy_addr, &token)
         } else {
             0
@@ -3159,6 +3146,10 @@ impl YieldVault {
     /// is created with a 24-hour timelock. Call `execute_withdrawal` after the
     /// timelock expires to complete the transfer.
     ///
+    /// A user with a pending large withdrawal cannot queue another one: the
+    /// request is rejected until the pending withdrawal is executed or
+    /// cancelled with [`Self::cancel_withdrawal`] (#1680).
+    ///
     /// ### Parameters
     /// * `user` - The share holder (requires auth).
     /// * `shares` - The number of shares to burn.
@@ -3211,6 +3202,14 @@ impl YieldVault {
                 .map_err(|_| VaultError::MathOverflow)?;
 
         if assets_to_return > threshold {
+            // A user may not queue a second large withdrawal while one is
+            // already pending (#1680): the pending request must be executed
+            // or cancelled first, so we never silently overwrite it and
+            // restart its 24-hour timelock.
+            if env.storage().instance().has(&DataKey::PendingWithdrawal(user.clone())) {
+                return Err(VaultError::WithdrawalCooldownActive);
+            }
+
             // Create a pending withdrawal with a 24-hour timelock
             let unlock_ts = env
                 .ledger()
@@ -3267,6 +3266,39 @@ impl YieldVault {
         .map_err(|_| VaultError::MathOverflow)?;
 
         Self::do_withdraw(&env, &mut state, user, pending.shares, assets_to_return)
+    }
+
+    /// Returns the pending large withdrawal for `user`, if one exists.
+    pub fn pending_withdrawal(env: Env, user: Address) -> Option<PendingWithdrawal> {
+        env.storage().instance().get(&DataKey::PendingWithdrawal(user))
+    }
+
+    /// Cancel a pending large withdrawal before its timelock expires.
+    ///
+    /// The caller must own the pending withdrawal (`user.require_auth()`).
+    /// Cancelling removes the pending entry so the user can submit a new
+    /// withdrawal instead of waiting out the 24-hour timelock (#1681).
+    ///
+    /// ### Errors
+    /// * [`VaultError::NoPendingWithdrawal`] - no pending withdrawal exists
+    ///   for `user`.
+    pub fn cancel_withdrawal(env: Env, user: Address) -> Result<(), VaultError> {
+        user.require_auth();
+
+        let pending: PendingWithdrawal = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWithdrawal(user.clone()))
+            .ok_or(VaultError::NoPendingWithdrawal)?;
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingWithdrawal(user.clone()));
+
+        env.events()
+            .publish((symbol_short!("pndwcn"), user), (pending.shares, pending.unlock_timestamp));
+
+        Ok(())
     }
 
     /// Internal: burns shares, transfers assets, updates state.
@@ -4545,6 +4577,11 @@ impl YieldVault {
         if threshold <= 0 {
             return Err(VaultError::InvalidDaoThreshold);
         }
+        let total_assets: i128 = env.storage().instance().get(&DataKey::TotalAssets).unwrap_or(0);
+        let max_threshold = total_assets.saturating_mul(95).saturating_div(100);
+        if threshold > max_threshold {
+            return Err(VaultError::InvalidDaoThreshold);
+        }
         env.storage()
             .instance()
             .set(&DataKey::LargeWithdrawalThreshold, &threshold);
@@ -4625,6 +4662,10 @@ impl YieldVault {
         let admin: Address = get_admin(&env).expect("Admin not set");
         admin.require_auth();
         Self::assert_admin_param_interval(&env)?;
+        const MAX_COOLDOWN: u64 = 365 * 24 * 60 * 60;
+        if seconds > MAX_COOLDOWN {
+            return Err(VaultError::InvalidDaoThreshold);
+        }
         let old: u64 = env
             .storage()
             .instance()
